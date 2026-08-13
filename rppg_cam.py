@@ -202,7 +202,8 @@ def main():
     print(f"[心率] HR ≈ {hr:.1f} bpm")
 
     # 3) PPG -> 74维特征 -> 窗口/组 -> 血压
-    flag, wf, nvalid = get_window_feature(ppg, fs=900, min_cycles=10)
+    # 注意: 必须用真实帧率 fs(摄像头实际 fps), 不能填算法内部假设的 900
+    flag, wf, nvalid = get_window_feature(ppg, fs=fs, min_cycles=6)
     print(f"[窗口特征] flag={flag}, n_valid_cycles={nvalid}")
     if flag != 0 or not wf:
         print("[血压] 特征不足, 需更长的稳定采集")
