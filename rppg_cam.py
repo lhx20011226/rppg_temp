@@ -81,8 +81,17 @@ def calc_hr_snr(ppg, fs):
     return float(snr)
 
 
-# SNR 低于此阈值视为心率不可信 (对应原生 RefHRMinSNR 思路)
-HR_SNR_THRESHOLD = 0.0
+# 心率有效性判定 (对齐 libCoreEngineV2.so::FilterHRUsingPreviousDataRGB 意图)
+# 原生不对瞬时 SNR 一票否决, 而是:
+#   - 维护历史 HR/SNR 窗口, 用高置信 HR 加权得到平滑最终 HR (b_CalWeightMean)
+#   - 仅在 SNR 持续极低(无信号)时才退回 refHR / 放弃
+# 这里是务实复刻参数:
+HR_WINDOW_SEC = 3.0        # 历史窗口采样间隔(秒)
+HR_MIN_VALID_SAMPLES = 3   # 历史中"可用"样本最少个数, 低于则判定信号不足
+HR_PHYS_LO, HR_PHYS_HI = 40.0, 200.0   # 心率生理合理区间(原生大量 0<HR 检查)
+# 单窗 SNR 可用门槛: 原生瞬时 SNR 是 log10(peak/total)+0.6 量纲(约 -0.5~0.5),
+# 这里取"基本有主频"的下限, 低于它的窗仅不计入加权、但不否决整体。
+HR_SNR_USABLE = -1.0
 
 
 # ---------------- 74 维特征 (移植自 extract_ppg_features.pyc) ----------------
@@ -154,6 +163,22 @@ def get_window_group_feature(window_group_list):
 
 
 # ---------------- 摄像头采集 ----------------
+def _weighted_hr(history):
+    """对齐原生 b_CalWeightMean: 用 SNR 做权重对历史 HR 加权得到稳定 HR。
+    history: list of (hr, snr)。仅用 snr>=HR_SNR_USABLE 的样本, 权重=sigmoid(snr)。"""
+    pts = [(hr, snr) for hr, snr in history
+           if hr is not None and HR_PHYS_LO <= hr <= HR_PHYS_HI and snr >= HR_SNR_USABLE]
+    if len(pts) < 1:
+        return None, 0
+    hrs = np.array([p[0] for p in pts], float)
+    # 权重: SNR 越高权重越大 (sigmoid 映射到 0~1, 避免极端值)
+    w = 1.0 / (1.0 + np.exp(-(np.array([p[1] for p in pts], float) + 0.3) * 4.0))
+    if w.sum() <= 0:
+        w = np.ones_like(hrs)
+    hr = float(np.sum(hrs * w) / w.sum())
+    return hr, len(pts)
+
+
 def collect(camera_idx, seconds, fps):
     import mediapipe as mp
     cap = cv2.VideoCapture(camera_idx)
@@ -164,12 +189,11 @@ def collect(camera_idx, seconds, fps):
         static_image_mode=False, max_num_faces=1,
         refine_landmarks=True, min_detection_confidence=0.5)
     rgb_ts = []          # ROI 平均 RGB 时序
-    frames = []
+    history = []         # 历史 (hr, snr) 窗口样本
     start = time.time()
     real_fs = fps
+    last_sample = start
     print(f"[采集] 开始 {seconds}s, 按 q 可提前结束")
-    # 实时 GUI: 用最近 ~5s 滑动窗估计 HR+SNR
-    win_sec = 5.0
     while time.time() - start < seconds:
         ret, frame = cap.read()
         if not ret:
@@ -178,32 +202,40 @@ def collect(camera_idx, seconds, fps):
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = mp_face.process(rgb)
-        # 默认取整帧中部区域作为 ROI (无人脸时退化为中心块)
         roi = rgb[h//3:2*h//3, w//3:2*w//3]
         mean_rgb = roi.reshape(-1, 3).mean(axis=0)
         rgb_ts.append(mean_rgb)
-        frames.append(frame)
-        # 画个框提示
         cv2.rectangle(frame, (w//3, h//3), (2*w//3, 2*h//3), (0, 255, 0), 2)
-        # 滑动窗实时心率 + SNR (模拟原生 App 的实时 HR 显示)
-        live_hr, live_snr = None, None
-        if len(rgb_ts) > 30:
-            tnow = time.time()
-            cut = int(max(0, len(rgb_ts) - win_sec * fps))
-            sub = chrom_extract(rgb_ts[cut:], fps)
+        # 每 HR_WINDOW_SEC 秒产生一个 (HR, SNR) 样本入历史 (对齐原生逐帧/逐窗 HR 累积)
+        now = time.time()
+        if now - last_sample >= HR_WINDOW_SEC and len(rgb_ts) > 30:
+            last_sample = now
+            sub = chrom_extract(rgb_ts, fps)
             sub = bandpass(sub, fps)
-            live_hr = estimate_hr(sub, fps)
-            live_snr = calc_hr_snr(sub, fps)
-        if live_hr is not None and live_snr is not None:
-            ok = live_snr >= HR_SNR_THRESHOLD
-            txt = f"HR={live_hr:.0f}  SNR={live_snr:.2f}"
-            col = (0, 255, 0) if ok else (0, 0, 255)
-            cv2.putText(frame, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
-            if not ok:
-                cv2.putText(frame, "signal weak, keep still", (10, 65),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            hr = estimate_hr(sub, fps)
+            snr = calc_hr_snr(sub, fps)
+            if hr is not None:
+                history.append((hr, snr))
+            # 实时显示: 用历史加权 HR (稳定, 不裸跳), 对齐原生实时 HR 显示
+            whr, nok = _weighted_hr(history)
+            if whr is not None:
+                col = (0, 255, 0) if nok >= HR_MIN_VALID_SAMPLES else (0, 255, 255)
+                cv2.putText(frame, f"HR≈{whr:.0f}  (n={nok})", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
+                if nok < HR_MIN_VALID_SAMPLES:
+                    cv2.putText(frame, "signal weak, keep still", (10, 65),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            else:
+                cv2.putText(frame, "collecting...", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         else:
-            cv2.putText(frame, "collecting...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            whr, _ = _weighted_hr(history)
+            if whr is not None:
+                cv2.putText(frame, f"HR≈{whr:.0f}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, "collecting...", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.imshow("rPPG", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -211,8 +243,8 @@ def collect(camera_idx, seconds, fps):
     cv2.destroyAllWindows()
     n = len(rgb_ts)
     real_fs = n / (time.time() - start) if (time.time() - start) > 0 else fps
-    print(f"[采集] 获得 {n} 帧, 实际帧率≈{real_fs:.1f}fps")
-    return np.array(rgb_ts), real_fs
+    print(f"[采集] 获得 {n} 帧, 实际帧率≈{real_fs:.1f}fps; 有效HR样本={len(history)}")
+    return np.array(rgb_ts), real_fs, history
 
 
 def main():
@@ -227,7 +259,7 @@ def main():
 
     # 1) 采集
     try:
-        rgb_ts, fs = collect(args.camera, args.seconds, args.fps)
+        rgb_ts, fs, history = collect(args.camera, args.seconds, args.fps)
     except Exception as e:
         print(f"[错误] 摄像头采集失败: {e}")
         print("  本环境无摄像头属正常; 在有摄像头的机器用此 venv 运行即可。")
@@ -239,12 +271,19 @@ def main():
     # 2) CHROM -> PPG
     ppg = chrom_extract(rgb_ts, fs)
     ppg = bandpass(ppg, fs)
-    hr = estimate_hr(ppg, fs)
-    snr = calc_hr_snr(ppg, fs)
-    hr_ok = (hr is not None) and (snr >= HR_SNR_THRESHOLD)
-    print(f"[心率] HR ≈ {hr:.1f} bpm" if hr else "[心率] 无法估计")
-    print(f"[心率SNR] {snr:.3f}  (阈值 {HR_SNR_THRESHOLD:.2f}, "
-          f"{'可信' if hr_ok else '不可信/信号弱'})")
+    # 最终 HR 用历史窗口加权 (对齐原生 FilterHRUsingPreviousDataRGB 的 b_CalWeightMean),
+    # 不再用瞬时 SNR 一票否决
+    hr, n_valid = _weighted_hr(history)
+    if hr is None:
+        # 退回: 用全段 FFT 兜底
+        hr = estimate_hr(ppg, fs)
+    snr_all = [s for _, s in history] if history else [-100]
+    snr_med = float(np.median(snr_all))
+    print(f"[心率·最终] HR ≈ {hr:.1f} bpm  (有效样本 {n_valid}/{len(history)})")
+    print(f"[心率SNR] 中位 {snr_med:.3f}  (单窗可用门槛 {HR_SNR_USABLE:.2f})")
+
+    # 有效性: 对齐原生意图 —— 仅在 有效样本过少 或 HR 非生理 时放弃 (不卡瞬时 SNR)
+    hr_valid = (hr is not None) and (HR_PHYS_LO <= hr <= HR_PHYS_HI) and (n_valid >= HR_MIN_VALID_SAMPLES)
 
     # 3) PPG -> 74维特征 -> 窗口/组 -> 血压
     # 注意: 必须用真实帧率 fs(摄像头实际 fps), 不能填算法内部假设的 900
@@ -253,8 +292,8 @@ def main():
     if flag != 0 or not wf:
         print("[血压] 特征不足, 需更长的稳定采集")
         sys.exit(0)
-    if not hr_ok:
-        print("[血压] 心率SNR过低, 本次信号质量不足以给出可信血压, 请重测并保持光线/稳定")
+    if not hr_valid:
+        print("[血压] 有效心率样本不足或心率非生理值, 信号质量不足以给出可信血压, 请重测")
         sys.exit(0)
     gflag, gf = get_window_group_feature([[wf], [wf], [wf]])
     try:
@@ -262,7 +301,7 @@ def main():
         bp = BPModel()
         # 注入元特征 f74=HR f75=年龄 f79=性别, 回归模型才能拿到真实信号
         gf_ext = list(gf) + [0.0] * (80 - len(gf))
-        gf_ext[74] = round(hr, 2)     # 平均心率
+        gf_ext[74] = round(hr, 2)     # 平均心率(历史加权)
         gf_ext[75] = float(args.age)  # 年龄
         gf_ext[79] = float(args.gender)
         res = bp.predict(gf_ext, height_cm=args.height, age_1_6=args.age // 10 + 1,
