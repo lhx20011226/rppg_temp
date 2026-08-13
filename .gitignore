@@ -1,0 +1,14 @@
+# venv 跨机器无法直接使用，排除（本地用 requirements.txt 重建）
+rppg_venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 临时脚本
+_git_check.sh
+_size_check.sh
+_git_setup.sh
+
+# 系统文件
+.DS_Store
