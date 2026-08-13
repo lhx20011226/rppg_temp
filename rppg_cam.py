@@ -63,6 +63,28 @@ def estimate_hr(ppg, fs):
     return float(hr)
 
 
+def calc_hr_snr(ppg, fs):
+    """复刻 libCoreEngineV2.so::CalHRSNR_core 末尾:
+       HRSNR = log10(主频峰值功率 / 全频谱总功率) + 0.6
+    返回 SNR (float)。值越高表示 PPG 信噪比越好, 心率越可信。"""
+    from scipy.signal import welch
+    ppg = np.asarray(ppg, float)
+    if len(ppg) < 8:
+        return -100.0
+    f, P = welch(ppg, fs=fs, nperseg=min(len(ppg), 512))
+    P = np.maximum(P, 0.0)
+    total = float(np.sum(P))
+    if total <= 0:
+        return -100.0
+    peak = float(np.max(P))
+    snr = np.log10(peak / total) + 0.6
+    return float(snr)
+
+
+# SNR 低于此阈值视为心率不可信 (对应原生 RefHRMinSNR 思路)
+HR_SNR_THRESHOLD = 0.0
+
+
 # ---------------- 74 维特征 (移植自 extract_ppg_features.pyc) ----------------
 def extract_single_cycle(y, fs=900):
     n = len(y)
@@ -146,7 +168,8 @@ def collect(camera_idx, seconds, fps):
     start = time.time()
     real_fs = fps
     print(f"[采集] 开始 {seconds}s, 按 q 可提前结束")
-    last_t = start
+    # 实时 GUI: 用最近 ~5s 滑动窗估计 HR+SNR
+    win_sec = 5.0
     while time.time() - start < seconds:
         ret, frame = cap.read()
         if not ret:
@@ -162,7 +185,25 @@ def collect(camera_idx, seconds, fps):
         frames.append(frame)
         # 画个框提示
         cv2.rectangle(frame, (w//3, h//3), (2*w//3, 2*h//3), (0, 255, 0), 2)
-        cv2.putText(frame, "collecting...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+        # 滑动窗实时心率 + SNR (模拟原生 App 的实时 HR 显示)
+        live_hr, live_snr = None, None
+        if len(rgb_ts) > 30:
+            tnow = time.time()
+            cut = int(max(0, len(rgb_ts) - win_sec * fps))
+            sub = chrom_extract(rgb_ts[cut:], fps)
+            sub = bandpass(sub, fps)
+            live_hr = estimate_hr(sub, fps)
+            live_snr = calc_hr_snr(sub, fps)
+        if live_hr is not None and live_snr is not None:
+            ok = live_snr >= HR_SNR_THRESHOLD
+            txt = f"HR={live_hr:.0f}  SNR={live_snr:.2f}"
+            col = (0, 255, 0) if ok else (0, 0, 255)
+            cv2.putText(frame, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
+            if not ok:
+                cv2.putText(frame, "signal weak, keep still", (10, 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        else:
+            cv2.putText(frame, "collecting...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
         cv2.imshow("rPPG", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -199,7 +240,11 @@ def main():
     ppg = chrom_extract(rgb_ts, fs)
     ppg = bandpass(ppg, fs)
     hr = estimate_hr(ppg, fs)
-    print(f"[心率] HR ≈ {hr:.1f} bpm")
+    snr = calc_hr_snr(ppg, fs)
+    hr_ok = (hr is not None) and (snr >= HR_SNR_THRESHOLD)
+    print(f"[心率] HR ≈ {hr:.1f} bpm" if hr else "[心率] 无法估计")
+    print(f"[心率SNR] {snr:.3f}  (阈值 {HR_SNR_THRESHOLD:.2f}, "
+          f"{'可信' if hr_ok else '不可信/信号弱'})")
 
     # 3) PPG -> 74维特征 -> 窗口/组 -> 血压
     # 注意: 必须用真实帧率 fs(摄像头实际 fps), 不能填算法内部假设的 900
@@ -207,6 +252,9 @@ def main():
     print(f"[窗口特征] flag={flag}, n_valid_cycles={nvalid}")
     if flag != 0 or not wf:
         print("[血压] 特征不足, 需更长的稳定采集")
+        sys.exit(0)
+    if not hr_ok:
+        print("[血压] 心率SNR过低, 本次信号质量不足以给出可信血压, 请重测并保持光线/稳定")
         sys.exit(0)
     gflag, gf = get_window_group_feature([[wf], [wf], [wf]])
     try:
@@ -222,8 +270,10 @@ def main():
         if "error" in res:
             print(f"[血压] 推理错误: {res['error']}")
         else:
-            print(f"[血压] 收缩压={res['hbp']}mmHg  舒张压={res['lbp']}mmHg "
+            print(f"[血压·最终结果] 收缩压={res['hbp']}mmHg  舒张压={res['lbp']}mmHg "
                   f"(融合原始值 hbp_raw={res['hbp_raw']}, lbp_raw={res['lbp_raw']}; "
+                  f"高压分段={'偏高' if res['hbp_is_high'] else '偏低'}, "
+                  f"低压分段={'偏高' if res['lbp_is_high'] else '偏低'}; "
                   f"身高={int(args.height)} 性别={args.gender})")
     except Exception as e:
         print(f"[血压] 推理未运行: {type(e).__name__}: {e}")

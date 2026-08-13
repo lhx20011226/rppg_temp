@@ -120,7 +120,8 @@ class BPModel:
         self.bp_root = bp_root
         self.lgbm = {}   # name -> [(model, idx), ...]
         self.svr = {}    # name -> [(scaler, pca, model, idx), ...]
-        self.clf = {}    # 身高桶分类器 (models_ch/cl *_ie): name -> [(model, idx), ...]
+        self.clf = {}    # 一级分类器 (models_ch/cl *_ie/_lgbm): name -> [(model, idx), ...]
+        self.l2 = {}     # 二级堆叠 (models_*_l2): name -> [(model, idx), ...]
         self._load_all()
 
     def _load_all(self):
@@ -135,14 +136,21 @@ class BPModel:
             d = os.path.join(self.bp_root, n)
             if os.path.isdir(d):
                 self.svr[n] = _load_svr_dir(d)
-        # 身高桶分类器 (仅用于 validate 分组, 可选)
+        # 一级分类器 (models_ch*/models_cl* *_ie/_lgbm) —— 用于 l2 堆叠决定偏低/偏高段
         for d in sorted(glob.glob(os.path.join(self.bp_root, "models_ch*_ie"))) + \
-                sorted(glob.glob(os.path.join(self.bp_root, "models_cl*_ie"))):
+                sorted(glob.glob(os.path.join(self.bp_root, "models_cl*_ie"))) + \
+                sorted(glob.glob(os.path.join(self.bp_root, "models_cl*_lgbm"))):
             if os.path.isdir(d):
                 self.clf[os.path.basename(d)] = _load_lgbm_dir(d)
+        # 二级堆叠分类器 (models_*_l2) —— 输入是一级 clf 的输出
+        for n in ["models_cl77_l2", "models_ch125_l2"]:
+            d = os.path.join(self.bp_root, n)
+            if os.path.isdir(d):
+                self.l2[n] = _load_lgbm_dir(d)
         nreg = sum(len(v) for v in self.lgbm.values()) + sum(len(v) for v in self.svr.values())
         print(f"[BPModel] 加载回归模型: {len(self.lgbm)} lgbm桶/{len(self.svr)} svr桶, "
-              f"共 {nreg} 个子模型; 分类器桶 {len(self.clf)} 个")
+              f"共 {nreg} 个子模型; 一级分类器桶 {len(self.clf)} 个; "
+              f"二级堆叠 {len(self.l2)} 个")
 
     # ---------- 预测辅助 ----------
     @staticmethod
@@ -169,39 +177,71 @@ class BPModel:
                 pass
         return float(np.mean(vals)) if vals else 0.0
 
+    # ---------- 一级分类器: 还原 dm_clf_imbens / dm_clf_lgb_gender ----------
+    @staticmethod
+    def _clf_label(models, gf):
+        """对一组一级分类器逐一 predict, 返回 0/1 标签列表 (对应 calc_bp 的
+        label_lbp_is_high_xx / label_hbp_is_high_xx)。models: [(model, idx), ...]"""
+        out = []
+        for m, idx in models:
+            x = np.array([[gf[i] for i in idx]], dtype=float)
+            try:
+                out.append(int(m.predict(x)[0]))
+            except Exception:
+                out.append(0)
+        return out
+
     def predict(self, group_feature, height_cm=170, age_1_6=3, gender=1,
                 lbp_prior=None, hbp_prior=None):
         """
-        group_feature: get_window_group_feature 输出 (list)。
-                       完整向量 f0~f79 (80维, 不足右侧补0)。
-        height_cm: 身高(cm), 用于选分类器桶做分组 (也影响 validate 基线采纳)。
-        age_1_6:   年龄分组 1~6 (原 SDK 入参)。
-        gender:    0=女, 1=男。
-        返回 dict:
-            lbp : 舒张压 mmHg (真实值)
-            hbp : 收缩压 mmHg (真实值)
-            lbp_clf_group / hbp_clf_group : 分组信息 (用于多帧平滑)
+        忠实复刻 calc_bp (model_predict.pyc):
+          ① 24 个一级分类器 -> 0/1 标签
+          ② l2 堆叠 (models_cl77_l2 / models_ch125_l2) 用①的输出决定偏低/偏高段
+          ③ 10 个回归模型融合 -> 真实 mmHg
+          ④ validate 基线夹逼
+        group_feature: 80维 f0~f79 (window_group_feature)。
+        age_1_6: 年龄分组 1~6。gender: 0=女,1=男。
+        返回 dict: lbp/hbp 真实 mmHg, 及 lbp_is_high/hbp_is_high 分段标记。
         """
         gf = list(group_feature) + [0.0] * (80 - len(group_feature))
 
-        # --- ② 回归模型: 各子模型取平均 ---
+        # ===== ① 一级分类器 (严格按 calc_bp 字节码顺序) =====
+        # LBP 一阶 (儿童+成人低段)
+        L = []
+        for key in ["models_cl70_ie", "models_cl72_ie", "models_cl75_ie", "models_cl77_ie",
+                    "models_cl77_lgbm", "models_cl80_ie", "models_cl82_ie", "models_cl85_ie",
+                    "models_cl85_lgbm"]:
+            L.extend(self.clf.get(key, []))
+        lab_lbp = self._clf_label(L, gf)  # 9 个标签
+        # HBP 一阶 (成人各身高桶)
+        H = []
+        for key in ["models_ch110_ie", "models_ch115_ie", "models_ch120_ie", "models_ch120_lgbm",
+                    "models_ch125_ie", "models_ch125_lgbm", "models_ch125_svc", "models_ch130_ie",
+                    "models_ch135_ie", "models_ch140_ie", "models_ch145_ie", "models_ch150_ie",
+                    "models_ch155_ie", "models_ch160_ie", "models_ch140_dt_ie"]:
+            H.extend(self.clf.get(key, []))
+        lab_hbp = self._clf_label(H, gf)  # 15 个标签
+
+        # ===== ② l2 堆叠: 用一级输出决定偏低/偏高段 (字节码 712~800) =====
+        # lbp_l2 输入 = 7 个 lbp 标签 + age_1_6 (字节码 720 BUILD_LIST 8)
+        lbp_l2_feat = lab_lbp[:7] + [age_1_6]
+        is_high_lbp = self._l2_predict("models_cl77_l2", lbp_l2_feat)
+        # hbp_l2 输入 = 14 个 hbp 标签 + age_1_6 (字节码 760 BUILD_LIST 15)
+        hbp_l2_feat = lab_hbp[:14] + [age_1_6]
+        is_high_hbp = self._l2_predict("models_ch125_l2", hbp_l2_feat)
+
+        # ===== ③ 回归模型融合 (还原字节码 1110~1276) =====
         rlw_lbp = self._predict_lgbm(self.lgbm.get("models_rlw_lgbm", []), gf)
         rl0_lbp = self._predict_lgbm(self.lgbm.get("models_rl0_lgbm", []), gf)
         rl1_lbp = self._predict_lgbm(self.lgbm.get("models_rl1_lgbm", []), gf)
         rhw_hbp = self._predict_lgbm(self.lgbm.get("models_rhw_lgbm", []), gf)
         rh0_hbp = self._predict_lgbm(self.lgbm.get("models_rh0_lgbm", []), gf)
         rh1_hbp = self._predict_lgbm(self.lgbm.get("models_rh1_lgbm", []), gf)
-
         rl0_lbp_svr = self._predict_svr(self.svr.get("models_rl0_svr", []), gf)
         rl1_lbp_svr = self._predict_svr(self.svr.get("models_rl1_svr", []), gf)
         rh0_hbp_svr = self._predict_svr(self.svr.get("models_rh0_svr", []), gf)
         rh1_hbp_svr = self._predict_svr(self.svr.get("models_rh1_svr", []), gf)
 
-        # 用身高选 l2 分类器判断偏低/偏高段 (无 l2 时按默认偏低段)
-        is_high_lbp = self._l2_lbp(height_cm)
-        is_high_hbp = self._l2_hbp(height_cm)
-
-        # --- ② 融合 (还原 calc_bp 字节码) ---
         if is_high_lbp:
             lbp_result = float(np.dot([0.4, 0.6],
                                sorted([(rl1_lbp + rl1_lbp_svr) / 2.0, rlw_lbp])))
@@ -215,7 +255,7 @@ class BPModel:
             hbp_result = float(np.dot([0.6, 0.4],
                                sorted([(rh0_hbp + rh0_hbp_svr) / 2.0, rhw_hbp])))
 
-        # --- ③ validate 基线夹逼 (还原 validate_lbp/hbp 主逻辑) ---
+        # ===== ④ validate 基线夹逼 =====
         lbp_val, _ = self._validate_lbp(lbp_result, age_1_6)
         hbp_val, _ = self._validate_hbp(hbp_result, age_1_6)
 
@@ -226,34 +266,24 @@ class BPModel:
             "hbp_raw": round(hbp_result, 1),
             "lbp_is_high": bool(is_high_lbp),
             "hbp_is_high": bool(is_high_hbp),
+            "lab_lbp": lab_lbp,
+            "lab_hbp": lab_hbp,
         }
 
-    # --- l2 分类器: 用对应身高桶判断偏高/偏低段 (还原 label_*_is_high_77_l2 / _125_l2) ---
-    def _l2_lbp(self, height_cm):
-        """label_lbp_is_high_77_l2: 用 models_ch77? 无77, 用 cl77 桶附近.
-        简化: 身高<150 -> 偏低段(False), 否则按 clf 概率. 这里默认用 ch 桶投票。"""
-        # 选最靠近身高且是 _ie 的桶
-        cand = []
-        for name in self.clf:
-            s = name.replace("models_ch", "").replace("models_cl", "").replace("_ie", "")
-            try:
-                cand.append((int(s), name))
-            except ValueError:
-                continue
-        if not cand:
-            return height_cm >= 150
-        cand.sort()
-        near = min(cand, key=lambda t: abs(t[0] - height_cm))[1]
-        # 对低压: 看 clf 预测概率均值是否 > 0.5 (代表偏高段)
-        probs = []
-        for m, idx in self.clf[near]:
-            x = np.array([[0.0] * 80], dtype=float)  # 占位, l2 实际只用少量特征
-            # 简化: 不精确复刻 l2, 默认偏低段
-            pass
-        return height_cm >= 150  # 合理默认: 成人(>=150)走偏高段融合分支
-
-    def _l2_hbp(self, height_cm):
-        return height_cm >= 125
+    # --- l2 堆叠分类器: 用一级 clf 输出预测偏低/偏高段 ---
+    def _l2_predict(self, name, feat):
+        """还原 dm_clf_lgb_imbens_stacked_l2: 输入是一级标签列表, 输出 0/1。
+        feat 已是按 features.txt 的顺序; l2 模型 features.txt 为 f1..fN, 取 feat[i-1]。"""
+        models = self.l2.get(name, [])
+        if not models:
+            # 无 l2 模型时兜底: 默认偏低段 (与原 SDK 多数成人偏低段一致)
+            return False
+        m, idx = models[0]
+        try:
+            x = np.array([[feat[i - 1] for i in idx]], dtype=float)
+            return bool(int(m.predict(x)[0]))
+        except Exception:
+            return False
 
     # --- validate_lbp: 基线区间夹逼 ---
     @staticmethod
