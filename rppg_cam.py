@@ -93,6 +93,18 @@ HR_PHYS_LO, HR_PHYS_HI = 40.0, 200.0   # 心率生理合理区间(原生大量 0
 # 这里取"基本有主频"的下限, 低于它的窗仅不计入加权、但不否决整体。
 HR_SNR_USABLE = -1.0
 
+# ---------------- ROI 几何 (逆向自 libcmtrack.so::TddFa::parseRoiBoxFrom*) ----------------
+# 原生每帧产出 2 个 ROI (CmTrackInterface::track @0x24da0 各调用一次):
+#   ROI A = parseRoiBoxFromBbox     -> 对齐 AllFace  (整个人脸区域)
+#   ROI B = parseRoiBoxFromLandmark -> 对齐 ForeHead (关键点区域, HR 主信号)
+# 常量已从 .so 的 .rodata 段提取 (见 ROI_REVERSE_ENGINEERING.md)。
+ROI_A_SCALE = 1.58      # parseRoiBoxFromBbox: size = round((W+H)/2 * 1.58)
+ROI_A_YOFF  = 0.14      # parseRoiBoxFromBbox: cy = y2 - H*0.5 + size*0.14
+# ROI B: 以关键点集质心为中心、半对角距 radius 为半边长的正方形 (见文档 §4)
+# 质量门控 (对齐原生 AssertInputData / c_CalS3CoreHR_RGB_Profile1_RGB_):
+ROI_MIN_VALID_PIXEL_PER = 0.30   # VaildPixelPer: ROI 内有效(非全黑)像素占比下限
+ROI_FRAME_RGB_CHANGE_TH = 0.06    # FaceRGBStdThresIgnore: 相邻帧 ROI 均值 RGB 变化上限(归一化)
+
 
 # ---------------- 74 维特征 (移植自 extract_ppg_features.pyc) ----------------
 def extract_single_cycle(y, fs=900):
@@ -179,6 +191,60 @@ def _weighted_hr(history):
     return hr, len(pts)
 
 
+# MediaPipe FaceMesh 前额关键点子集索引 (对齐原生 ForeHead = HR 主信号区域)。
+# 取额头/眉心区域的点: 10=眉心, 67/69/104/108 额头, 151/9 上额, 338/337/299 右额, 71/63 左额
+FOREHEAD_LM_IDS = [10, 67, 69, 104, 108, 151, 9, 338, 337, 299, 71, 63, 105, 66, 46, 57]
+
+
+def _roi_box_from_bbox(x1, y1, x2, y2):
+    """对齐 libcmtrack.so::parseRoiBoxFromBbox (AllFace ROI A)。
+    FaceBox 为两点矩形; size=round((W+H)/2*1.58); 中心在底边中心, 向左上扩展。"""
+    W = x2 - x1
+    H = y2 - y1
+    size = int(round((W + H) / 2 * ROI_A_SCALE))
+    if size < 4:
+        return None
+    cx = x2 - H * 0.5
+    cy = y2 - H * 0.5 + size * ROI_A_YOFF
+    x0 = int(round(cx - size / 2)); y0 = int(round(cy - size / 2))
+    return (x0, y0, x0 + size, y0 + size)
+
+
+def _roi_box_from_landmarks(pts_xy):
+    """对齐 libcmtrack.so::parseRoiBoxFromLandmark (ForeHead ROI B)。
+    pts_xy: list of (x,y) 像素坐标; 以质心为中心、半对角距 radius 为半边长的正方形。"""
+    if len(pts_xy) < 1:
+        return None
+    xs = [p[0] for p in pts_xy]; ys = [p[1] for p in pts_xy]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    dx = (xmax - xmin) * 0.5
+    dy = (ymax - ymin) * 0.5
+    import math
+    radius = math.sqrt(dx * dx + dy * dy) * 0.5   # 半对角距 * 0.5 (对齐 fmul 0.5)
+    if radius < 2:
+        return None
+    cx = (xmax + xmin) * 0.5
+    cy = (ymax + ymin) * 0.5
+    half = radius
+    x0 = int(round(cx - half)); y0 = int(round(cy - half))
+    s = int(round(half * 2))
+    return (x0, y0, x0 + s, y0 + s)
+
+
+def _roi_mean_and_valid(roi):
+    """返回 (mean_rgb[3], valid_pixel_per)。对齐原生 VaildPixelPer: 非全黑像素占比。"""
+    if roi.size == 0:
+        return None, 0.0
+    px = roi.reshape(-1, 3).astype(float)
+    # 有效像素: 非全黑 (R+G+B>0)。原生 "too many zeros" 即有效占比过低。
+    valid = (px.sum(axis=1) > 1.0)
+    vpp = float(valid.mean()) if len(px) else 0.0
+    if vpp < ROI_MIN_VALID_PIXEL_PER:
+        return None, vpp
+    return px[valid].mean(axis=0), vpp
+
+
 def collect(camera_idx, seconds, fps):
     import mediapipe as mp
     cap = cv2.VideoCapture(camera_idx)
@@ -188,8 +254,10 @@ def collect(camera_idx, seconds, fps):
     mp_face = mp.solutions.face_mesh.FaceMesh(
         static_image_mode=False, max_num_faces=1,
         refine_landmarks=True, min_detection_confidence=0.5)
-    rgb_ts = []          # ROI 平均 RGB 时序
+    rgb_ts = []          # ForeHead(ROI B) 平均 RGB 时序 —— HR 主信号
+    rgb_ts_allface = []  # AllFace(ROI A) 平均 RGB 时序 —— 背景/校验参考
     history = []         # 历史 (hr, snr) 窗口样本
+    prev_fore = None     # 上一帧 ForeHead 均值, 用于帧间变化门控
     start = time.time()
     real_fs = fps
     last_sample = start
@@ -202,11 +270,70 @@ def collect(camera_idx, seconds, fps):
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = mp_face.process(rgb)
-        roi = rgb[h//3:2*h//3, w//3:2*w//3]
-        mean_rgb = roi.reshape(-1, 3).mean(axis=0)
-        rgb_ts.append(mean_rgb)
-        cv2.rectangle(frame, (w//3, h//3), (2*w//3, 2*h//3), (0, 255, 0), 2)
-        # 每 HR_WINDOW_SEC 秒产生一个 (HR, SNR) 样本入历史 (对齐原生逐帧/逐窗 HR 累积)
+        if not (res.multi_face_landmarks):
+            cv2.putText(frame, "NO FACE - skip", (10, h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.imshow("rPPG", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue  # 无人脸: 跳过该帧, 不污染 PPG 时序
+        lm = res.multi_face_landmarks[0].landmark
+        # 人脸框 (两点矩形) —— 对齐 FaceBox(x1,y1,x2,y2)
+        xs = [p.x for p in lm]; ys = [p.y for p in lm]
+        fx0, fx1 = int(min(xs) * w), int(max(xs) * w)
+        fy0, fy1 = int(min(ys) * h), int(max(ys) * h)
+
+        # ---- ROI A: AllFace (parseRoiBoxFromBbox) ----
+        box_a = _roi_box_from_bbox(fx0, fy0, fx1, fy1)
+        fore_mean = allface_mean = None
+        if box_a is not None:
+            x0, y0, x1, y1 = box_a
+            x0, y0 = max(0, x0), max(0, y0)
+            x1, y1 = min(w, x1), min(h, y1)
+            roi_a = rgb[y0:y1, x0:x1]
+            allface_mean, vpp_a = _roi_mean_and_valid(roi_a)
+            cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 1)  # AllFace 绿框
+
+        # ---- ROI B: ForeHead (parseRoiBoxFromLandmark) —— HR 主信号 ----
+        fore_pts = [(int(lm[i].x * w), int(lm[i].y * h))
+                    for i in FOREHEAD_LM_IDS if i < len(lm)]
+        box_b = _roi_box_from_landmarks(fore_pts)
+        if box_b is not None:
+            x0, y0, x1, y1 = box_b
+            x0, y0 = max(0, x0), max(0, y0)
+            x1, y1 = min(w, x1), min(h, y1)
+            roi_b = rgb[y0:y1, x0:x1]
+            fore_mean, vpp_b = _roi_mean_and_valid(roi_b)
+            cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 0), 2)  # ForeHead 青框
+
+        # ---- 质量门控 (对齐原生) ----
+        # 1) 至少 ForeHead 有效; 2) 帧间 ForeHead 均值 RGB 变化不超过阈值(否则 skip)
+        if fore_mean is None:
+            cv2.putText(frame, "ROI invalid - skip", (10, h - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.imshow("rPPG", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
+        if prev_fore is not None:
+            prev = np.asarray(prev_fore, float); cur = np.asarray(fore_mean, float)
+            if prev.sum() > 0:
+                change = float(np.abs(cur - prev).sum() / (prev.sum() + 1e-6))
+                if change > ROI_FRAME_RGB_CHANGE_TH:
+                    cv2.putText(frame, "motion - skip frame", (10, h - 80),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    prev_fore = cur
+                    cv2.imshow("rPPG", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    continue  # 对齐 FaceRGBStdThresIgnore: 变化过大丢弃该帧
+        prev_fore = np.asarray(fore_mean, float)
+
+        rgb_ts.append(fore_mean)                 # 主信号: ForeHead
+        if allface_mean is not None:
+            rgb_ts_allface.append(allface_mean)  # 参考: AllFace
+
+        # 每 HR_WINDOW_SEC 秒产生一个 (HR, SNR) 样本入历史
         now = time.time()
         if now - last_sample >= HR_WINDOW_SEC and len(rgb_ts) > 30:
             last_sample = now
@@ -216,7 +343,6 @@ def collect(camera_idx, seconds, fps):
             snr = calc_hr_snr(sub, fps)
             if hr is not None:
                 history.append((hr, snr))
-            # 实时显示: 用历史加权 HR (稳定, 不裸跳), 对齐原生实时 HR 显示
             whr, nok = _weighted_hr(history)
             if whr is not None:
                 col = (0, 255, 0) if nok >= HR_MIN_VALID_SAMPLES else (0, 255, 255)
@@ -243,7 +369,7 @@ def collect(camera_idx, seconds, fps):
     cv2.destroyAllWindows()
     n = len(rgb_ts)
     real_fs = n / (time.time() - start) if (time.time() - start) > 0 else fps
-    print(f"[采集] 获得 {n} 帧, 实际帧率≈{real_fs:.1f}fps; 有效HR样本={len(history)}")
+    print(f"[采集] 获得 {n} 帧(ForeHead主信号), 实际帧率≈{real_fs:.1f}fps; 有效HR样本={len(history)}")
     return np.array(rgb_ts), real_fs, history
 
 
