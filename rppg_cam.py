@@ -86,18 +86,22 @@ def make_window_fullscreen(name, w, h):
 
 # ---------------- rPPG 信号提取 (CHROM) ----------------
 def chrom_extract(rgb_ts, fs):
-    """CHROM: 输入 (N,3) RGB 时序, 返回 PPG 信号 (N,)"""
+    """CHROM: 输入 (N,3) RGB 时序, 返回 PPG 信号 (N,)。
+
+    对齐 libCoreEngineV2.so::c_CalS3CoreHR_RGB_Profile1_RGB_ 的投影系数:
+    反编译末尾确认投影为 2*R - G - B (三个输入通道 a/b/c 的组合 = 2a - b - c,
+    其中 a=R, b=G, c=B)。这与经典 CHROM 的 2R-G-B 一致。
+    注意: 原生在投影前对每个通道做 b_filtfilt / c_filtfilt (零相移带通),
+    这里返回时不做带通(带通在调用方 estimate_hr 前统一做 bandpass,
+    与调用链 c_CalS3CoreHR -> ... -> CalHRSNR_core 的顺序一致)。"""
     rgb = np.asarray(rgb_ts, float)
     rgb = rgb - np.mean(rgb, axis=0, keepdims=True)  # 去均值
     std = np.std(rgb, axis=0, keepdims=True)
     std[std == 0] = 1.0
     rgb = rgb / std
-    # 投影
-    X = rgb[:, 0] - rgb[:, 2]          # R - B
-    Y = rgb[:, 0] + rgb[:, 2] - 2 * rgb[:, 1]  # R + B - 2G
-    # 带通近似: 用二阶差分模拟 (实际用下面 butter 带通)
-    alpha = np.std(X) / (np.std(Y) + 1e-9)
-    ppg = X - alpha * Y
+    R, G, B = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    # 对齐原生 2R - G - B 投影
+    ppg = 2.0 * R - G - B
     return ppg
 
 
@@ -517,6 +521,33 @@ def _roi_mean_and_valid(roi):
     return px[valid].mean(axis=0), vpp
 
 
+def _draw_hud(frame, h, *, hr_f=None, snr_f=None, hr_a=None, snr_a=None,
+              whr=None, nok=0, best_src="-", unst=False, status="采集中...",
+              status_color=(0, 255, 0), status_y=30):
+    """统一绘制常驻 HUD: 双 ROI 的 SNR/HR + 最终心率 + 状态 + 操作提示。
+    所有分支(正常帧/评估窗/跳过帧)都调用本函数, 保证文字始终可见。"""
+    # 双 ROI SNR/HR (无论是否达标都显示, 颜色区分)
+    snr_fc = (0, 255, 0) if (hr_f is not None and snr_f is not None and snr_f >= HR_SNR_USABLE) else (0, 0, 255)
+    snr_ac = (0, 255, 0) if (hr_a is not None and snr_a is not None and snr_a >= HR_SNR_USABLE) else (0, 0, 255)
+    cv2.putText(frame, f"前额SNR={snr_f if snr_f is not None else -99:+.2f} HR={hr_f if hr_f else 0:.0f}",
+                (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, snr_fc, 2)
+    cv2.putText(frame, f"全脸SNR={snr_a if snr_a is not None else -99:+.2f} HR={hr_a if hr_a else 0:.0f}",
+                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, snr_ac, 2)
+    # 最终心率 (历史中位数)
+    if whr is not None:
+        col = (0, 255, 0) if (nok >= HR_MIN_VALID_SAMPLES and not unst) else (0, 255, 255)
+        put_text_cn(frame, f"心率≈{whr:.0f}  (n={nok} 优选:{best_src})", (10, 30), col, 0.9, 2)
+        if unst:
+            put_text_cn(frame, "心率波动大-数据不稳", (10, 65), (0, 165, 255), 0.8, 2)
+        elif nok < HR_MIN_VALID_SAMPLES:
+            put_text_cn(frame, "信号弱, 请保持静止", (10, 65), (0, 255, 255), 0.8, 2)
+    else:
+        put_text_cn(frame, status, (10, status_y), status_color, 1, 2)
+    # 常驻操作提示 (全屏/窗口切换)
+    put_text_cn(frame, "F键/双击: 全屏切换  Q: 退出", (10, h - 24),
+                (200, 200, 200), 0.55, 1)
+
+
 def collect(camera_idx, seconds, fps):
     import mediapipe as mp
     cap = cv2.VideoCapture(camera_idx)
@@ -537,6 +568,8 @@ def collect(camera_idx, seconds, fps):
     rgb_ts_allface = []  # AllFace(ROI A) 平均 RGB 时序 —— 背景/校验参考
     history = []         # 历史 (hr, snr) 窗口样本
     prev_fore = None     # 上一帧 ForeHead 均值, 用于帧间变化门控
+    # 缓存最近一次双 ROI 评估结果, 让非评估窗/跳过帧也能显示 HR/SNR
+    cache = {"hr_f": None, "snr_f": None, "hr_a": None, "snr_a": None}
     start = time.time()
     real_fs = fps
     last_sample = start
@@ -550,7 +583,12 @@ def collect(camera_idx, seconds, fps):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = mp_face.process(rgb)
         if not (res.multi_face_landmarks):
-            put_text_cn(frame, "NO FACE - skip", (10, h - 20), (0, 0, 255), 0.8, 2)
+            # 常驻 HUD (用缓存的上一次结果, 保证文字不消失)
+            whr, nok, unst = _mean_hr(history)
+            _draw_hud(frame, h, whr=whr, nok=nok, unst=unst,
+                      hr_f=cache["hr_f"], snr_f=cache["snr_f"],
+                      hr_a=cache["hr_a"], snr_a=cache["snr_a"],
+                      status="NO FACE - 等待人脸", status_color=(0, 0, 255), status_y=30)
             cv2.imshow("rPPG", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -593,7 +631,11 @@ def collect(camera_idx, seconds, fps):
         # ---- 质量门控 (对齐原生) ----
         # 1) 至少 ForeHead 有效; 2) 帧间 ForeHead 均值 RGB 变化不超过阈值(否则 skip)
         if fore_mean is None:
-            put_text_cn(frame, "ROI invalid - skip", (10, h - 50), (0, 0, 255), 0.7, 2)
+            whr, nok, unst = _mean_hr(history)
+            _draw_hud(frame, h, whr=whr, nok=nok, unst=unst,
+                      hr_f=cache["hr_f"], snr_f=cache["snr_f"],
+                      hr_a=cache["hr_a"], snr_a=cache["snr_a"],
+                      status="ROI无效-跳过", status_color=(0, 0, 255), status_y=30)
             cv2.imshow("rPPG", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -603,8 +645,12 @@ def collect(camera_idx, seconds, fps):
             if prev.sum() > 0:
                 change = float(np.abs(cur - prev).sum() / (prev.sum() + 1e-6))
                 if change > ROI_FRAME_RGB_CHANGE_TH:
-                    put_text_cn(frame, "motion - skip frame", (10, h - 80), (0, 165, 255), 0.7, 2)
                     prev_fore = cur
+                    whr, nok, unst = _mean_hr(history)
+                    _draw_hud(frame, h, whr=whr, nok=nok, unst=unst,
+                              hr_f=cache["hr_f"], snr_f=cache["snr_f"],
+                              hr_a=cache["hr_a"], snr_a=cache["snr_a"],
+                              status="运动过大-丢帧", status_color=(0, 165, 255), status_y=30)
                     cv2.imshow("rPPG", frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
@@ -642,41 +688,29 @@ def collect(camera_idx, seconds, fps):
             # 仅 SNR 达标的窗才入历史 (低 SNR = 无主频 = 不显示/不采纳)
             if snr_ok:
                 history.append((hr, snr))
-            whr, nok, unst = _mean_hr(history)
-            # 实时显示 双 ROI 的 SNR (无论是否达标)
-            snr_fc = (0, 255, 0) if (hr_f is not None and snr_f >= HR_SNR_USABLE) else (0, 0, 255)
-            snr_ac = (0, 255, 0) if (hr_a is not None and snr_a >= HR_SNR_USABLE) else (0, 0, 255)
-            cv2.putText(frame, f"前额SNR={snr_f:+.2f} HR={hr_f if hr_f else 0:.0f}",
-                        (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, snr_fc, 2)
-            cv2.putText(frame, f"全脸SNR={snr_a if snr_a else -99:+.2f} HR={hr_a if hr_a else 0:.0f}",
-                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, snr_ac, 2)
-            if not snr_ok:
-                # SNR 低: 明确不显示 HR, 提示信号差
-                put_text_cn(frame, "信号差-SNR过低, 不显示心率", (10, 30), (0, 0, 255), 0.9, 2)
-            elif whr is not None:
-                col = (0, 255, 0) if (nok >= HR_MIN_VALID_SAMPLES and not unst) else (0, 255, 255)
-                put_text_cn(frame, f"心率≈{whr:.0f}  (n={nok} 优选:{best_src})", (10, 30), col, 0.9, 2)
-                if unst:
-                    put_text_cn(frame, "心率波动大-数据不稳", (10, 65), (0, 165, 255), 0.8, 2)
-                elif nok < HR_MIN_VALID_SAMPLES:
-                    put_text_cn(frame, "信号弱, 请保持静止", (10, 65), (0, 255, 255), 0.8, 2)
-            else:
-                put_text_cn(frame, "采集中...", (10, 30), (0, 255, 0), 1, 2)
+            # 缓存到 cache, 供非评估窗/跳过帧持续显示
+            cache.update({"hr_f": hr_f, "snr_f": snr_f, "hr_a": hr_a, "snr_a": snr_a})
+        # 统一绘制 HUD (每帧都画, 文字常驻)
+        whr, nok, unst = _mean_hr(history)
+        best_src = cache.get("best_src", "-")
+        if not history:
+            # 还没攒够一个评估窗: 显示"采集中"但双ROI SNR 仍显示
+            _draw_hud(frame, h, whr=None,
+                      hr_f=cache["hr_f"], snr_f=cache["snr_f"],
+                      hr_a=cache["hr_a"], snr_a=cache["snr_a"],
+                      status="采集中...", status_color=(0, 255, 0), status_y=30)
         else:
-            whr, _, _ = _mean_hr(history)
-            # 非评估窗也显示最近一次 SNR 状态 + 操作提示
-            if history:
-                last_snr = history[-1][1]
-                snr_col = (0, 255, 0) if last_snr >= HR_SNR_USABLE else (0, 0, 255)
-                cv2.putText(frame, f"SNR={last_snr:+.2f}", (10, 95),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, snr_col, 2)
-            if whr is not None:
-                put_text_cn(frame, f"心率≈{whr:.0f}", (10, 30), (0, 255, 0), 0.9, 2)
+            # 评估窗已产生: 若最新窗 SNR 不达标, 顶部显示信号差提示(但心率数值仍画)
+            last_snr = history[-1][1]
+            if last_snr < HR_SNR_USABLE:
+                _draw_hud(frame, h, whr=whr, nok=nok, unst=unst,
+                          hr_f=cache["hr_f"], snr_f=cache["snr_f"],
+                          hr_a=cache["hr_a"], snr_a=cache["snr_a"],
+                          status="信号差-SNR过低", status_color=(0, 0, 255), status_y=150)
             else:
-                put_text_cn(frame, "采集中...", (10, 30), (0, 255, 0), 1, 2)
-        # 常驻操作提示 (全屏/窗口切换)
-        put_text_cn(frame, "F键/双击: 全屏切换  Q: 退出", (10, h - 24),
-                    (200, 200, 200), 0.55, 1)
+                _draw_hud(frame, h, whr=whr, nok=nok, unst=unst, best_src=best_src,
+                          hr_f=cache["hr_f"], snr_f=cache["snr_f"],
+                          hr_a=cache["hr_a"], snr_a=cache["snr_a"])
         cv2.imshow("rPPG", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
