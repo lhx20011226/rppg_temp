@@ -499,11 +499,13 @@ def _roi_box_from_landmarks(pts_xy):
         cx = (xmin + xmax) * 0.5 ;  cy = (ymin + ymax) * 0.5
         // 先以 maxspan 为半边长算出临时框, 再取该框的**对角线**作为最终正方形边长:
         diag = sqrt( (2*half0)^2 + (2*half0)^2 )   // = sqrt(dx^2+dy^2) (包围盒对角线)
-        x0 = (cx - half0) - diag*0.5
-        y0 = (cy - half0) - diag*0.5
-        ROI_B = [x0, y0, x0+diag, y0+diag]          // 边长 = 对角线, 比 max(dx,dy) 大
-    (之前误写成 half=max(dx,dy)*0.5 -> 边长=maxspan, 比原生小 sqrt2 倍,
-     导致前额 ROI 没覆盖足够区域; 现按对角线修正。)"""
+        x0 = cx - diag*0.5
+        y0 = cy - diag*0.5
+        ROI_B = [x0, y0, x0+diag, y0+diag]          // 中心 = (cx,cy), 边长 = 对角线
+    注意: 最终正方形必须**以质心 (cx,cy) 为中心**, 不能额外减 half0 —— 之前
+    写成 (cx-half0)-diag*0.5 会把框向左上偏移约 2.4*half0, 远超人脸范围,
+    clamp 后框跑到画面角落 (GUI 位置错) 且取色区错乱 -> 实时心率错。
+    现严格以 (cx,cy) 为中心、边长=diag。"""
     import math
     if len(pts_xy) < 1:
         return None
@@ -521,8 +523,9 @@ def _roi_box_from_landmarks(pts_xy):
     diag = math.sqrt((2.0 * half0) ** 2 + (2.0 * half0) ** 2)
     if diag < 4:
         return None
-    x0 = int(round((cx - half0) - diag * 0.5))
-    y0 = int(round((cy - half0) - diag * 0.5))
+    # 关键: 最终框以质心 (cx,cy) 为中心, 边长=diag (不再额外减 half0)
+    x0 = int(round(cx - diag * 0.5))
+    y0 = int(round(cy - diag * 0.5))
     s = int(round(diag))
     return (x0, y0, x0 + s, y0 + s)
 
@@ -592,6 +595,7 @@ def collect(camera_idx, seconds, fps):
     start = time.time()
     real_fs = fps
     last_sample = start
+    frame_times = []   # 每帧(有效采样)到达的真实时间戳, 用于按真实帧率算 HR
     print(f"[采集] 开始 {seconds}s, 按 q 可提前结束")
     while time.time() - start < seconds:
         ret, frame = cap.read()
@@ -676,6 +680,7 @@ def collect(camera_idx, seconds, fps):
                     continue  # 对齐 FaceRGBStdThresIgnore: 变化过大丢弃该帧
         prev_fore = np.asarray(fore_mean, float)
 
+        frame_times.append(time.time())
         rgb_ts.append(fore_mean)                 # 主信号: ForeHead
         if allface_mean is not None:
             rgb_ts_allface.append(allface_mean)  # 参考: AllFace
@@ -686,16 +691,24 @@ def collect(camera_idx, seconds, fps):
         now = time.time()
         if now - last_sample >= HR_WINDOW_SEC and len(rgb_ts) > 30:
             last_sample = now
+            # 用本段真实帧率算 HR: 摄像头实际 fps 常与参数不符 -> 直接套用会整体缩放心率。
+            # 取本窗实际样本数 / 实际耗时 = 窗内真实帧率 (对齐原生按真实采样间隔做 FFT)。
+            if len(frame_times) >= 2:
+                win_dur = frame_times[-1] - frame_times[0]
+                cur_fs = len(frame_times) / win_dur if win_dur > 1e-3 else fps
+            else:
+                cur_fs = fps
+            real_fs = cur_fs
             # ForeHead (ROI B) 主信号
-            sub_f = chrom_extract(rgb_ts, fps)
-            hr_f = estimate_hr(sub_f, fps)
-            snr_f = calc_hr_snr(sub_f, fps)
+            sub_f = chrom_extract(rgb_ts, cur_fs)
+            hr_f = estimate_hr(sub_f, cur_fs)
+            snr_f = calc_hr_snr(sub_f, cur_fs)
             # AllFace (ROI A) 参考信号
             hr_a = snr_a = None
             if len(rgb_ts_allface) > 30:
-                sub_a = chrom_extract(rgb_ts_allface, fps)
-                hr_a = estimate_hr(sub_a, fps)
-                snr_a = calc_hr_snr(sub_a, fps)
+                sub_a = chrom_extract(rgb_ts_allface, cur_fs)
+                hr_a = estimate_hr(sub_a, cur_fs)
+                snr_a = calc_hr_snr(sub_a, cur_fs)
             # 选 SNR 更高者入历史 (e_maximum: 取最优 ROI 的 HR)
             hr = snr = None
             best_src = "-"
