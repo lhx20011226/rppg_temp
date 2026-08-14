@@ -45,16 +45,18 @@
 源码：`TddFa::parseRoiBoxFromBbox(FaceBox const&, vector<float>&)` @ 0x22520
 反汇编已逐条还原。FaceBox 为**两点矩形** (x1,y1,x2,y2)（cv::Mat 内 4 个 float）。
 
-精确公式（伪代码，常量已从 .rodata 提取）：
+精确公式（C++ 反编译逐条还原，常量已从 .rodata 提取）：
 ```
-W = x2 - x1
-H = y2 - y1
-size = round( (W + H) / 2 * 1.58 )      // 常量 SCALE = 1.58 (vaddr 0x184f8)
-cx   = x2 - H * 0.5                       // 框宽方向按 H/2 从右边界往左
-cy   = y2 - H * 0.5 + size * 0.14        // 常量 YOFF = 0.14 (vaddr 0x18508)
+W = (int)x2 - (int)x1
+H = (int)y2 - (int)y1
+i1   = W + H
+size = (int)( (i1 >> 1) * 1.58 )         // 先整数除2, 再乘 SCALE=1.58 (vaddr 0x184f8)
+cx   = (int)x2 - W * 0.5 - size * 0.5     // 注意减的是 W(不是H!), 再左移半 size
+cy   = (int)y2 - H * 0.5 + (i1>>1)*0.14 - size*0.5   // YOFF=0.14 (vaddr 0x18508)
 ROI_A = [ cx, cy, cx + size, cy + size ]  // 正方形，size×size
 ```
 即：以人脸框**底边中心**为基准，向左上扩展一个 `size×size` 的正方形 ROI。
+⚠️ 早期版本曾把 cx 里的 W 错写成 H、且 (W+H)/2 顺序错，导致 ROI 偏离人脸 → 心率错乱。已修正。
 
 ## 4. ROI B — parseRoiBoxFromLandmark（对齐 ForeHead，HR 主信号）
 
@@ -66,18 +68,18 @@ ROI_A = [ cx, cy, cx + size, cy + size ]  // 正方形，size×size
 ```
 dx = xmax - xmin
 dy = ymax - ymin
-d  = sqrt( (dx*0.5)^2 + (dy*0.5)^2 )   // 点集半对角距 = 半径
+d  = max(dx, dy) * 0.5                  // 取 x/y 跨度较大者 *0.5, 不是 sqrt(dx^2+dy^2)!
 cx = (xmax + xmin) * 0.5
 cy = (ymax + ymin) * 0.5
-half = d * 0.5
-ROI_B = [ cx - half, cy - half, cx + half, cy + half ]   // 正方形
+half = d
+ROI_B = [ cx - half, cy - half, cx + half, cy + half ]   // 正方形, 边长=2*d=max(dx,dy)
 ```
-即：**以点集（关键点）包围盒的质心为中心、以半对角距 radius 为半边长**的正方形 ROI。
+即：**以点集（关键点）包围盒的质心为中心、以 max(dx,dy)/2 为半边长**的正方形 ROI。
+⚠️ 早期版本误用 `sqrt(dx^2+dy^2)*0.5`（欧氏半对角距），会让 ROI 偏小且偏圆，已修正。
 
-实测时 `track` 传入的 landmarkMat 为 SeetaFace5 的 5 点（[左眼,右眼,鼻尖,左嘴角,右嘴
-角] 标准顺序，row(0) 为第 0 点=左眼）；更可能 landmark 矩阵布局为 2×N（行=xy），
-row(0)=全部点的 x。两种情况都落在"关键点集质心+半径"逻辑内，复刻时我们直接用
-MediaPipe 选定的前额关键点子集套用同一公式即可。
+传入 `parseRoiBoxFromLandmark` 的矩阵来自 `this+0x38`，即 SeetaFace5 的 5 点
+（顺序=[左眼,右眼,鼻尖,左嘴角,右嘴角]）。复刻时用 MediaPipe 对应点:
+`[33(左眼),263(右眼),1(鼻尖),61(左嘴角),291(右嘴角)]` 求包围盒套用同一公式。
 
 ## 5. ROI 像素统计与质量门控（对齐原生 AssertInputData / validation）
 

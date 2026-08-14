@@ -107,48 +107,186 @@ ROI_FRAME_RGB_CHANGE_TH = 0.06    # FaceRGBStdThresIgnore: 相邻帧 ROI 均值 
 
 
 # ---------------- 74 维特征 (移植自 extract_ppg_features.pyc) ----------------
+# 关键修正: 原生 extract_ppg_features 对每个 PPG cycle 先用 CubicSpline 重采样到
+# 900Hz 网格 (repro_rppg_bp.py:107: new_x = linspace(0,len-1, int(900/300*(len-1))+1)),
+# 再调用 extract_single_cycle(new_y, fs=900)。fs 是内部固定 900, 不是摄像头真实 fps!
+# 之前用真实 fps 传入使所有时间特征错 ~30 倍 -> 74维特征整体错误 -> BP 塌缩到基线。
+FEATURE_FS = 900
+_FROM_SCIPY = True
+try:
+    from scipy.interpolate import CubicSpline
+except Exception:
+    _FROM_SCIPY = False
+
+
+def _resample_cycle_to_900(cyc):
+    """对齐 repro_rppg_bp.py:107: CubicSpline 重采样到 900Hz 相对网格。"""
+    cyc = np.asarray(cyc, float)
+    xs = np.arange(len(cyc))
+    if _FROM_SCIPY and len(cyc) >= 4:
+        cs = CubicSpline(xs, cyc)
+        new_x = np.linspace(0, len(cyc) - 1, int(FEATURE_FS / 300.0 * (len(cyc) - 1)) + 1)
+        return cs(new_x)
+    # 退化: 线性重采样
+    new_n = max(4, int(FEATURE_FS / 300.0 * (len(cyc) - 1)) + 1)
+    return np.interp(np.linspace(0, len(cyc) - 1, new_n), xs, cyc)
+
+
 def extract_single_cycle(y, fs=900):
+    """返回 74 维特征 (对齐 features_74.py 定义)。y: 单周期 PPG, 首=左谷 末=右谷。"""
+    y = np.asarray(y, float)
     n = len(y)
+    if n < 4:
+        return None
     valley_left, valley_right = 0, n - 1
     x = np.arange(n, dtype=float)
     peak = int(np.argmax(y[valley_left:valley_right])) + valley_left
     if peak <= valley_left or peak >= valley_right:
         return None
-    deriv = np.gradient(y, x)
-    apg = np.gradient(deriv, x)
+    try:
+        deriv = np.gradient(y, x)
+        apg = np.gradient(deriv, x)
+    except Exception:
+        return None
     f = [0.0] * 74
+    # ---- f0~f3 时长类 ----
     f[0] = (valley_right - valley_left) / fs
     f[1] = (peak - valley_left) / fs
     f[2] = (valley_right - peak) / fs
     f[3] = f[1] / f[0] if f[0] else 0.0
-    f[32] = (y[peak] - y[valley_left]) / (x[peak] - x[valley_left]) if (x[peak]-x[valley_left]) else 0.0
-    f[33] = (y[valley_right] - y[peak]) / (x[valley_right] - x[peak]) if (x[valley_right]-x[peak]) else 0.0
-    f[34] = float(np.max(deriv))
-    f[22] = np.trapz(y[valley_left:peak + 1], x[valley_left:peak + 1])
-    f[23] = np.trapz(y[peak:valley_right + 1], x[peak:valley_right + 1])
-    f[24] = f[22] + f[23]
-    a_pos = valley_left + int(np.argmax(apg[valley_left:peak]))
+    # ---- 关键点定位 (apg 二阶导) ----
+    a_pos = valley_left + int(np.argmax(apg[valley_left:peak])) if peak > valley_left else peak
     b_c = np.where(apg[valley_left:peak] < 0)[0]
     b_pos = (valley_left + b_c[np.argmin(apg[valley_left:peak][b_c])]) if len(b_c) else peak
     dc = np.where(y[peak:valley_right] >= 0.5 * y[peak])[0]
     e_pos = peak + (dc[-1] if len(dc) else 0)
-    f[36] = apg[a_pos]; f[37] = apg[b_pos]; f[38] = apg[e_pos]
-    f[39] = apg[b_pos] / apg[a_pos] if apg[a_pos] else 0.0
-    f[40] = apg[e_pos] / apg[a_pos] if apg[a_pos] else 0.0
+    e_pos = min(e_pos, valley_right)
+    # ---- f4~f8 apg/位置比 ----
+    if (peak - valley_left) > 0:
+        f[4] = (a_pos - valley_left) / (peak - valley_left)
+    f[5] = (e_pos - valley_left) / f[0] if f[0] else 0.0
+    if (peak - valley_left) > 0:
+        f[6] = (a_pos - valley_left) / (peak - valley_left)
+        f[7] = (b_pos - a_pos) / (peak - valley_left)
+    if (valley_right - e_pos) > 0:
+        f[8] = (e_pos - e_pos) / (valley_right - e_pos)  # inflection~e_pos 退化, 占位
+    # ---- f9~f21 宽度类 (幅值>=thr*peak 的跨度, 单位 s) ----
+    for thr, idx0 in [(0.1, 9), (0.25, 10), (0.33, 11), (0.5, 12), (0.66, 13), (0.75, 14)]:
+        m = y[valley_left:peak + 1] >= thr * y[peak]
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    for thr, idx0 in [(0.1, 15), (0.25, 16), (0.33, 17), (0.5, 18), (0.66, 19), (0.75, 20)]:
+        m = y[peak:valley_right + 1] >= thr * y[peak]
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    m = deriv >= 0.25 * (np.max(deriv) if len(deriv) else 1)
+    idxs = np.where(m)[0]
+    f[21] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    # ---- f22~f24 面积 ----
+    f[22] = np.trapz(y[valley_left:peak + 1], x[valley_left:peak + 1]) if peak > valley_left else 0.0
+    f[23] = np.trapz(y[peak:valley_right + 1], x[peak:valley_right + 1]) if valley_right > peak else 0.0
+    f[24] = f[22] + f[23]
+    # ---- f25~f28 分段面积 ----
+    dp = a_pos if a_pos > valley_left else peak
+    f[25] = np.trapz(y[valley_left:dp + 1], x[valley_left:dp + 1]) if dp > valley_left else 0.0
+    f[26] = np.trapz(y[dp:peak + 1], x[dp:peak + 1]) if peak > dp else 0.0
+    f[27] = np.trapz(y[peak:e_pos + 1], x[peak:e_pos + 1]) if e_pos > peak else 0.0
+    f[28] = np.trapz(y[e_pos:valley_right + 1], x[e_pos:valley_right + 1]) if valley_right > e_pos else 0.0
+    denom = (f[25] + f[26] + f[27])
+    f[29] = f[28] / denom if denom else 0.0
+    # ---- f30~f31 平均斜率 ----
+    f[30] = float(np.mean(deriv[valley_left:peak + 1])) if peak > valley_left else 0.0
+    f[31] = float(np.mean(deriv[peak:valley_right + 1])) if valley_right > peak else 0.0
+    # ---- f32~f34 斜率/峰值 ----
+    f[32] = (y[peak] - y[valley_left]) / (x[peak] - x[valley_left]) if (x[peak] - x[valley_left]) else 0.0
+    f[33] = (y[valley_right] - y[peak]) / (x[valley_right] - x[peak]) if (x[valley_right] - x[peak]) else 0.0
+    f[34] = float(np.max(deriv)) if len(deriv) else 0.0
+    # ---- f35 曲率 (e_pos 处) ----
+    if 0 < e_pos < n - 1:
+        f[35] = float(apg[e_pos])
+    # ---- f36~f42 apg 幅度/比值 ----
+    f[36] = float(apg[a_pos])
+    f[37] = float(apg[b_pos])
+    f[38] = float(apg[e_pos])
+    f[39] = f[37] / f[36] if f[36] else 0.0
+    f[40] = f[38] / f[36] if f[36] else 0.0
     f[41] = f[39] - f[40]
     f[42] = y[e_pos] / y[peak] if y[peak] else 0.0
+    # ---- f43~f44 delta_t (inflection≈e_pos) ----
+    f[43] = (e_pos - peak) / fs
+    f[44] = f[43] / f[0] if f[0] else 0.0
+    # ---- f45/f55 导数宽度 ----
+    m = deriv >= 0.75 * (np.max(deriv) if len(deriv) else 1)
+    idxs = np.where(m)[0]
+    f[45] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    # ---- f46~f49 导数左右宽度 ----
+    for thr, idx0 in [(0.33, 46), (0.66, 47)]:
+        m = deriv[valley_left:peak + 1] >= thr * (np.max(deriv[valley_left:peak + 1]) if peak > valley_left else 1)
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    for thr, idx0 in [(0.33, 48), (0.66, 49)]:
+        m = deriv[peak:valley_right + 1] >= thr * (np.max(deriv[peak:valley_right + 1]) if valley_right > peak else 1)
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    # ---- f50~f55 导数面积 ----
+    f[50] = np.trapz(np.clip(deriv[valley_left:dp + 1], 0, None), x[valley_left:dp + 1]) if dp > valley_left else 0.0
+    f[51] = np.trapz(np.clip(deriv[dp:peak + 1], 0, None), x[dp:peak + 1]) if peak > dp else 0.0
+    f[52] = np.trapz(np.clip(deriv[peak:e_pos + 1], None, 0), x[peak:e_pos + 1]) if e_pos > peak else 0.0
+    f[53] = float(np.mean(deriv[a_pos:dp + 1])) if dp > a_pos else 0.0
+    f[54] = float(np.mean(deriv[dp:b_pos + 1])) if b_pos > dp else 0.0
+    f[55] = float(np.mean(deriv[peak:e_pos + 1])) if e_pos > peak else 0.0
+    # ---- f56~f57 导数曲率 ----
+    f[56] = float(deriv[e_pos]) if 0 < e_pos < n else 0.0
+    f[57] = f[56] / f[34] if f[34] else 0.0
+    # ---- f58~f65 扩展宽度/对称性 (归一化占位, 与原生一致近似) ----
+    for thr, idx0 in [(0.33, 58), (0.66, 59)]:
+        m = y[valley_left:peak + 1] >= thr * y[peak]
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    for thr, idx0 in [(0.33, 60), (0.66, 61)]:
+        m = y[peak:valley_right + 1] >= thr * y[peak]
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    for thr, idx0 in [(0.33, 62), (0.66, 63)]:
+        m = deriv[valley_left:peak + 1] >= thr * (np.max(deriv[valley_left:peak + 1]) if peak > valley_left else 1)
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    for thr, idx0 in [(0.33, 64), (0.66, 65)]:
+        m = deriv[peak:valley_right + 1] >= thr * (np.max(deriv[peak:valley_right + 1]) if valley_right > peak else 1)
+        idxs = np.where(m)[0]
+        f[idx0] = (idxs[-1] - idxs[0]) / fs if len(idxs) else 0.0
+    # ---- f66~f73 对称性 (usdc/dsdc) ----
+    if y[peak] > 0:
+        left = y[valley_left:peak + 1] - y[valley_left]
+        right = y[peak:valley_right + 1] - y[peak]
+        L = min(len(left), len(right))
+        # 上侧对称偏差 (peak 两侧相对幅度)
+        usdc = np.abs(left[:L] - right[:L][::-1]) if L else np.array([0.0])
+        f[66] = float(np.mean(usdc[:max(1, len(usdc)//5)]))
+        f[67] = float(np.median(usdc)) if len(usdc) else 0.0
+        f[68] = float(np.mean(usdc[max(0, len(usdc)*4//5):])) if len(usdc) else 0.0
+        f[69] = float(np.std(usdc)) if len(usdc) else 0.0
+        # 下侧对称偏差 (以 valley 为基准)
+        dl = y[valley_left:peak + 1] - y[peak]
+        dr = y[peak:valley_right + 1] - y[valley_right]
+        dsdc = np.abs(dl[:L] - dr[:L][::-1]) if L else np.array([0.0])
+        f[70] = float(np.mean(dsdc[:max(1, len(dsdc)//5)]))
+        f[71] = float(np.median(dsdc)) if len(dsdc) else 0.0
+        f[72] = float(np.mean(dsdc[max(0, len(dsdc)*4//5):])) if len(dsdc) else 0.0
+        f[73] = float(np.std(dsdc)) if len(dsdc) else 0.0
+    if np.any(np.isnan(f)) or np.any(np.isinf(f)):
+        return None
     return f
 
 
-def get_window_feature(ppg, fs=900, min_cycles=10):
-    """把一段连续 PPG 按波谷切成 cycle (谷-峰-谷), 提取 74 维并平均。
-    对应 Calculate_PPG_IBI 输出的 ppg_cycles_list。"""
+def get_window_feature(ppg, fs=30, min_cycles=10):
+    """把一段连续 PPG 按波谷切成 cycle (谷-峰-谷), 每个 cycle 重采样到 900Hz 后提取 74 维并平均。
+    对应 Calculate_PPG_IBI 输出的 ppg_cycles_list + extract_ppg_features。
+    注意: fs 参数此处仅用于波谷检测的距离阈值(真实帧率), 特征内部固定用 900Hz。"""
     from scipy.signal import find_peaks
-    # 找局部极小 (波谷): 用 -ppg 找峰
-    neg = -ppg
-    # 谷间距不小于 0.4s
-    min_dist = int(0.4 * fs)
-    valleys, _ = find_peaks(neg, distance=min_dist)
+    # 找局部极小 (波谷): 用 -ppg 找峰; 谷间距不小于 0.4s
+    min_dist = max(2, int(0.4 * fs))
+    valleys, _ = find_peaks(-ppg, distance=min_dist)
     if len(valleys) < 2:
         return 1, [], 0
     cycles = [ppg[valleys[i]:valleys[i + 1] + 1] for i in range(len(valleys) - 1)]
@@ -158,11 +296,12 @@ def get_window_feature(ppg, fs=900, min_cycles=10):
     for c in cycles:
         if len(c) < min_dist * 0.5:
             continue
-        f = extract_single_cycle(np.asarray(c, float), fs=fs)
-        if f is None or np.any(np.isnan(f)):
+        rc = _resample_cycle_to_900(c)               # 重采样到 900Hz 网格
+        f = extract_single_cycle(rc, fs=FEATURE_FS)   # 内部固定 fs=900
+        if f is None:
             continue
         feats.append(f)
-    if len(feats) < min_cycles - 2:
+    if len(feats) < max(1, min_cycles - 2):
         return 2, [], len(feats)
     return 0, list(np.mean(feats, axis=0)), len(feats)
 
@@ -191,42 +330,65 @@ def _weighted_hr(history):
     return hr, len(pts)
 
 
-# MediaPipe FaceMesh 前额关键点子集索引 (对齐原生 ForeHead = HR 主信号区域)。
-# 取额头/眉心区域的点: 10=眉心, 67/69/104/108 额头, 151/9 上额, 338/337/299 右额, 71/63 左额
-FOREHEAD_LM_IDS = [10, 67, 69, 104, 108, 151, 9, 338, 337, 299, 71, 63, 105, 66, 46, 57]
+# MediaPipe FaceMesh 关键点, 对齐原生 parseRoiBoxFromLandmark 的输入:
+# 原生 this+0x38 缓存的是 SeetaFace5 的 5 点 = [左眼, 右眼, 鼻尖, 左嘴角, 右嘴角]
+# (顺序见 TddFa::track 注释 row(0)=第0点=左眼)。ForeHead ROI 即这 5 点包围盒算出。
+# 映射到 MediaPipe 478 点: 左眼=33, 右眼=263, 鼻尖=1, 左嘴角=61, 右嘴角=291。
+FOREHEAD_LM_IDS = [33, 263, 1, 61, 291]
 
 
 def _roi_box_from_bbox(x1, y1, x2, y2):
-    """对齐 libcmtrack.so::parseRoiBoxFromBbox (AllFace ROI A)。
-    FaceBox 为两点矩形; size=round((W+H)/2*1.58); 中心在底边中心, 向左上扩展。"""
-    W = x2 - x1
-    H = y2 - y1
-    size = int(round((W + H) / 2 * ROI_A_SCALE))
+    """对齐 libcmtrack.so::parseRoiBoxFromBbox (AllFace ROI A) @0x22520。
+
+    反编译得到的精确 C++ (注意 (int) 截断与运算顺序):
+        W  = (int)x2 - (int)x1
+        H  = (int)y2 - (int)y1
+        i1 = W + H
+        size = (int)(((i1) >> 1) * 1.58)          // 先整数除2, 再乘 SCALE
+        cx = (int)x2 - W*0.5 - size/2             // 注意减的是 W, 不是 H
+        cy = (int)y2 - H*0.5 + (i1>>1)*0.14 - size/2
+        ROI_A = [cx, cy, cx+size, cy+size]
+    即: 以人脸框底边中心为基准, 向左上扩展 size×size 正方形。
+    (之前版本把 cx 里的 W 错写成 H, 且 (W+H)/2 顺序错, 导致 ROI 偏离人脸 -> 心率错乱)"""
+    W = int(x2) - int(x1)
+    H = int(y2) - int(y1)
+    if W <= 0 or H <= 0:
+        return None
+    i1 = W + H
+    size = int((i1 >> 1) * ROI_A_SCALE)          # (W+H)//2 * 1.58
     if size < 4:
         return None
-    cx = x2 - H * 0.5
-    cy = y2 - H * 0.5 + size * ROI_A_YOFF
-    x0 = int(round(cx - size / 2)); y0 = int(round(cy - size / 2))
+    cx = x2 - W * 0.5 - size * 0.5
+    cy = y2 - H * 0.5 + (i1 >> 1) * ROI_A_YOFF - size * 0.5
+    x0 = int(round(cx)); y0 = int(round(cy))
     return (x0, y0, x0 + size, y0 + size)
 
 
 def _roi_box_from_landmarks(pts_xy):
-    """对齐 libcmtrack.so::parseRoiBoxFromLandmark (ForeHead ROI B)。
-    pts_xy: list of (x,y) 像素坐标; 以质心为中心、半对角距 radius 为半边长的正方形。"""
+    """对齐 libcmtrack.so::parseRoiBoxFromLandmark (ForeHead ROI B) @0x233f4。
+
+    反编译精确逻辑 (输入矩阵为 2×N: row0=x, row1=y, 分别求 x/y 的 min/max):
+        dx = xmax - xmin ;  dy = ymax - ymin
+        d  = max(dx, dy) * 0.5                  // 取 x/y 跨度较大者, 不是 sqrt!
+        cx = (xmin + xmax) * 0.5
+        cy = (ymin + ymax) * 0.5
+        half = d
+        ROI_B = [cx-half, cy-half, cx+half, cy+half]   // 边长 = 2*d = max(dx,dy)
+    (之前版本用 sqrt(dx^2+dy^2)*0.5 是错的, 会让 ROI 偏小且偏圆)"""
+    import math
     if len(pts_xy) < 1:
         return None
     xs = [p[0] for p in pts_xy]; ys = [p[1] for p in pts_xy]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    dx = (xmax - xmin) * 0.5
-    dy = (ymax - ymin) * 0.5
-    import math
-    radius = math.sqrt(dx * dx + dy * dy) * 0.5   # 半对角距 * 0.5 (对齐 fmul 0.5)
-    if radius < 2:
+    dx = xmax - xmin
+    dy = ymax - ymin
+    d = max(dx, dy) * 0.5                        # 关键: max, 不是 sqrt
+    if d < 2:
         return None
     cx = (xmax + xmin) * 0.5
     cy = (ymax + ymin) * 0.5
-    half = radius
+    half = d
     x0 = int(round(cx - half)); y0 = int(round(cy - half))
     s = int(round(half * 2))
     return (x0, y0, x0 + s, y0 + s)
@@ -412,36 +574,36 @@ def main():
     hr_valid = (hr is not None) and (HR_PHYS_LO <= hr <= HR_PHYS_HI) and (n_valid >= HR_MIN_VALID_SAMPLES)
 
     # 3) PPG -> 74维特征 -> 窗口/组 -> 血压
-    # 注意: 必须用真实帧率 fs(摄像头实际 fps), 不能填算法内部假设的 900
-    flag, wf, nvalid = get_window_feature(ppg, fs=fs, min_cycles=6)
+    # 关键: get_window_feature 内部把每个 cycle 重采样到 900Hz 再提特征(fs 固定900),
+    # 这里传入的 fs 仅用于波谷检测距离阈值(真实帧率)。
+    flag, wf, nvalid = get_window_feature(ppg, fs=fs, min_cycles=10)
     print(f"[窗口特征] flag={flag}, n_valid_cycles={nvalid}")
     if flag != 0 or not wf:
-        print("[血压] 特征不足, 需更长的稳定采集")
-        sys.exit(0)
-    if not hr_valid:
-        print("[血压] 有效心率样本不足或心率非生理值, 信号质量不足以给出可信血压, 请重测")
-        sys.exit(0)
-    gflag, gf = get_window_group_feature([[wf], [wf], [wf]])
-    try:
-        from bp_inference import BPModel
-        bp = BPModel()
-        # 注入元特征 f74=HR f75=年龄 f79=性别, 回归模型才能拿到真实信号
-        gf_ext = list(gf) + [0.0] * (80 - len(gf))
-        gf_ext[74] = round(hr, 2)     # 平均心率(历史加权)
-        gf_ext[75] = float(args.age)  # 年龄
-        gf_ext[79] = float(args.gender)
-        res = bp.predict(gf_ext, height_cm=args.height, age_1_6=args.age // 10 + 1,
-                         gender=args.gender)
-        if "error" in res:
-            print(f"[血压] 推理错误: {res['error']}")
-        else:
-            print(f"[血压·最终结果] 收缩压={res['hbp']}mmHg  舒张压={res['lbp']}mmHg "
-                  f"(融合原始值 hbp_raw={res['hbp_raw']}, lbp_raw={res['lbp_raw']}; "
-                  f"高压分段={'偏高' if res['hbp_is_high'] else '偏低'}, "
-                  f"低压分段={'偏高' if res['lbp_is_high'] else '偏低'}; "
-                  f"身高={int(args.height)} 性别={args.gender})")
-    except Exception as e:
-        print(f"[血压] 推理未运行: {type(e).__name__}: {e}")
+        print("[血压] 特征不足(cycle 数不够或切割失败), 需更长的稳定采集, 本次跳过血压")
+    elif not hr_valid:
+        print("[血压] 有效心率样本不足或心率非生理值, 信号质量不足以给出可信血压, 本次跳过")
+    else:
+        gflag, gf = get_window_group_feature([[wf]])
+        try:
+            from bp_inference import BPModel
+            bp = BPModel()
+            # 注入元特征 f74=HR f75=年龄 f79=性别, 回归模型才能拿到真实信号
+            gf_ext = list(gf) + [0.0] * (80 - len(gf))
+            gf_ext[74] = round(hr, 2)     # 平均心率(历史加权)
+            gf_ext[75] = float(args.age)  # 年龄
+            gf_ext[79] = float(args.gender)
+            res = bp.predict(gf_ext, height_cm=args.height, age_1_6=args.age // 10 + 1,
+                             gender=args.gender)
+            if "error" in res:
+                print(f"[血压] 推理错误: {res['error']}")
+            else:
+                print(f"[血压·最终结果] 收缩压={res['hbp']}mmHg  舒张压={res['lbp']}mmHg "
+                      f"(融合原始值 hbp_raw={res['hbp_raw']}, lbp_raw={res['lbp_raw']}; "
+                      f"高压分段={'偏高' if res['hbp_is_high'] else '偏低'}, "
+                      f"低压分段={'偏高' if res['lbp_is_high'] else '偏低'}; "
+                      f"身高={int(args.height)} 性别={args.gender})")
+        except Exception as e:
+            print(f"[血压] 推理未运行: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
