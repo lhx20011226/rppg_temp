@@ -85,30 +85,42 @@ def make_window_fullscreen(name, w, h):
 
 
 # ---------------- rPPG 信号提取 (CHROM) ----------------
+def _bandpass_one(sig, fs, lo=0.7, hi=4.0):
+    """单通道零相移带通 (对齐原生 b_filtfilt / c_filtfilt)。"""
+    from scipy.signal import butter, filtfilt
+    sig = np.asarray(sig, float)
+    if len(sig) < 8:
+        return sig - sig.mean()
+    nyq = fs / 2.0
+    lo = max(1e-3, min(lo, nyq - 1e-3))
+    hi = max(lo + 1e-3, min(hi, nyq - 1e-3))
+    b, a = butter(3, [lo / nyq, hi / nyq], btype="band")
+    return filtfilt(b, a, sig)
+
+
 def chrom_extract(rgb_ts, fs):
     """CHROM: 输入 (N,3) RGB 时序, 返回 PPG 信号 (N,)。
 
-    对齐 libCoreEngineV2.so::c_CalS3CoreHR_RGB_Profile1_RGB_ 的投影系数:
-    反编译末尾确认投影为 2*R - G - B (三个输入通道 a/b/c 的组合 = 2a - b - c,
-    其中 a=R, b=G, c=B)。这与经典 CHROM 的 2R-G-B 一致。
-    注意: 原生在投影前对每个通道做 b_filtfilt / c_filtfilt (零相移带通),
-    这里返回时不做带通(带通在调用方 estimate_hr 前统一做 bandpass,
-    与调用链 c_CalS3CoreHR -> ... -> CalHRSNR_core 的顺序一致)。"""
+    对齐 libCoreEngineV2.so::c_CalS3CoreHR_RGB_Profile1_RGB_ 反编译:
+      1) 先对每个通道 (R/G/B) 各自做零相移带通 b_filtfilt / c_filtfilt
+         (见反编译 LAB_0015df4c / LAB_0015e07c 之前的 b_filtfilt(...) 调用);
+      2) 再按 2*Rf - Gf - Bf 投影 (反编译末尾
+         '(((*pdVar14+*pdVar14)-*pdVar44)-*pdVar45)' = 2a - b - c, a=R b=G c=B)。
+    注意: 之前误用了 std 通道归一化, 会把高振幅的 R 脉搏压低、把 G/B 噪声放大,
+    导致投影后信号被噪声主导 -> filtfilt 在噪声上泄漏出 2 倍频伪峰(心率翻倍)。
+    现严格按原生顺序: 逐通道带通后再投影, 不做 std 归一化。"""
     rgb = np.asarray(rgb_ts, float)
-    rgb = rgb - np.mean(rgb, axis=0, keepdims=True)  # 去均值
-    std = np.std(rgb, axis=0, keepdims=True)
-    std[std == 0] = 1.0
-    rgb = rgb / std
-    R, G, B = rgb[:, 0], rgb[:, 1], rgb[:, 2]
-    # 对齐原生 2R - G - B 投影
+    R = _bandpass_one(rgb[:, 0], fs)   # R 通道先零相移带通
+    G = _bandpass_one(rgb[:, 1], fs)   # G 通道
+    B = _bandpass_one(rgb[:, 2], fs)   # B 通道
+    # 对齐原生 2*Rf - Gf - Bf 投影
     ppg = 2.0 * R - G - B
     return ppg
 
 
 def bandpass(sig, fs, lo=0.7, hi=4.0):
-    from scipy.signal import butter, filtfilt
-    b, a = butter(3, [lo / (fs / 2), hi / (fs / 2)], btype="band")
-    return filtfilt(b, a, sig)
+    """对外兼容接口: 直接对单通道做零相移带通。"""
+    return _bandpass_one(sig, fs)
 
 
 def _hr_snr_one(ppg, fs):
@@ -483,12 +495,15 @@ def _roi_box_from_landmarks(pts_xy):
 
     反编译精确逻辑 (输入矩阵为 2×N: row0=x, row1=y, 分别求 x/y 的 min/max):
         dx = xmax - xmin ;  dy = ymax - ymin
-        d  = max(dx, dy) * 0.5                  // 取 x/y 跨度较大者, 不是 sqrt!
-        cx = (xmin + xmax) * 0.5
-        cy = (ymin + ymax) * 0.5
-        half = d
-        ROI_B = [cx-half, cy-half, cx+half, cy+half]   // 边长 = 2*d = max(dx,dy)
-    (之前版本用 sqrt(dx^2+dy^2)*0.5 是错的, 会让 ROI 偏小且偏圆)"""
+        half0 = max(dx, dy) * 0.5
+        cx = (xmin + xmax) * 0.5 ;  cy = (ymin + ymax) * 0.5
+        // 先以 maxspan 为半边长算出临时框, 再取该框的**对角线**作为最终正方形边长:
+        diag = sqrt( (2*half0)^2 + (2*half0)^2 )   // = sqrt(dx^2+dy^2) (包围盒对角线)
+        x0 = (cx - half0) - diag*0.5
+        y0 = (cy - half0) - diag*0.5
+        ROI_B = [x0, y0, x0+diag, y0+diag]          // 边长 = 对角线, 比 max(dx,dy) 大
+    (之前误写成 half=max(dx,dy)*0.5 -> 边长=maxspan, 比原生小 sqrt2 倍,
+     导致前额 ROI 没覆盖足够区域; 现按对角线修正。)"""
     import math
     if len(pts_xy) < 1:
         return None
@@ -497,14 +512,18 @@ def _roi_box_from_landmarks(pts_xy):
     ymin, ymax = min(ys), max(ys)
     dx = xmax - xmin
     dy = ymax - ymin
-    d = max(dx, dy) * 0.5                        # 关键: max, 不是 sqrt
-    if d < 2:
+    half0 = max(dx, dy) * 0.5
+    if half0 < 2:
         return None
     cx = (xmax + xmin) * 0.5
     cy = (ymax + ymin) * 0.5
-    half = d
-    x0 = int(round(cx - half)); y0 = int(round(cy - half))
-    s = int(round(half * 2))
+    # 临时框边长 = 2*half0; 对角线 = sqrt((2half0)^2+(2half0)^2)
+    diag = math.sqrt((2.0 * half0) ** 2 + (2.0 * half0) ** 2)
+    if diag < 4:
+        return None
+    x0 = int(round((cx - half0) - diag * 0.5))
+    y0 = int(round((cy - half0) - diag * 0.5))
+    s = int(round(diag))
     return (x0, y0, x0 + s, y0 + s)
 
 
@@ -668,13 +687,13 @@ def collect(camera_idx, seconds, fps):
         if now - last_sample >= HR_WINDOW_SEC and len(rgb_ts) > 30:
             last_sample = now
             # ForeHead (ROI B) 主信号
-            sub_f = bandpass(chrom_extract(rgb_ts, fps), fps)
+            sub_f = chrom_extract(rgb_ts, fps)
             hr_f = estimate_hr(sub_f, fps)
             snr_f = calc_hr_snr(sub_f, fps)
             # AllFace (ROI A) 参考信号
             hr_a = snr_a = None
             if len(rgb_ts_allface) > 30:
-                sub_a = bandpass(chrom_extract(rgb_ts_allface, fps), fps)
+                sub_a = chrom_extract(rgb_ts_allface, fps)
                 hr_a = estimate_hr(sub_a, fps)
                 snr_a = calc_hr_snr(sub_a, fps)
             # 选 SNR 更高者入历史 (e_maximum: 取最优 ROI 的 HR)
@@ -749,9 +768,8 @@ def main():
         print("[错误] 采集样本过少")
         sys.exit(1)
 
-    # 2) CHROM -> PPG
+    # 2) CHROM -> PPG (chrom_extract 已内含逐通道带通+2R-G-B 投影)
     ppg = chrom_extract(rgb_ts, fs)
-    ppg = bandpass(ppg, fs)
     # 最终 HR = 历史有效窗(仅 SNR>=门槛)的**中位数**, 对齐 CalculateInstantHRVIndex2_RGB
     # 的 b_vmedian (反编译 @0x18c2d4 实测: 核心聚合是 b_vmedian 而非均值; 均值会显著拉偏)。
     # SNR 加权(b_CalWeightMean)是另一条 HRV 子路径, 不参与最终 HR 输出。
