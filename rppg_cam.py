@@ -59,13 +59,29 @@ def put_text_cn(frame, text, pos, color=(0, 255, 0), scale=0.7, thickness=2):
 
 
 def make_window_fullscreen(name, w, h):
-    """创建可全屏窗口 (按 F 或双击标题栏可全屏; 这里默认最大化)。"""
+    """创建可全屏/窗口化切换的窗口。
+
+    默认窗口化(用户可自由缩放); 按 F 键 或 双击窗口 切换全屏。
+    注册鼠标回调实现双击 -> 全屏/窗口切换 (对齐用户要求的"全屏/窗口化")。"""
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-    try:
-        cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    except Exception:
-        pass
-    cv2.resizeWindow(name, w, h)
+    cv2.resizeWindow(name, min(w, 1280), min(h, 720))   # 默认窗口化显示
+    _fs_state = {"full": False}
+
+    def _toggle():
+        _fs_state["full"] = not _fs_state["full"]
+        try:
+            cv2.setWindowProperty(
+                name, cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN if _fs_state["full"] else cv2.WINDOW_NORMAL)
+        except Exception:
+            pass
+
+    def _on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            _toggle()
+    cv2.setMouseCallback(name, _on_mouse)
+    # 把 toggle 暴露给调用方 (F 键复用)
+    make_window_fullscreen._toggle = _toggle
 
 
 # ---------------- rPPG 信号提取 (CHROM) ----------------
@@ -91,33 +107,66 @@ def bandpass(sig, fs, lo=0.7, hi=4.0):
     return filtfilt(b, a, sig)
 
 
+def _hr_snr_one(ppg, fs):
+    """对齐 libCoreEngineV2.so::b_CalHRSNR_core 的单段 HR+SNR 计算。
+
+    逆向确认的核心步骤:
+      1) 固定 N=4096 点 FFT (rfft), 频率轴 f = k*fs/N;
+      2) 功率谱 P = |FFT|^2;
+      3) 在 0.7~4.0Hz 频带内用 findpeaks(高度>全局最大*0.3) 找主频峰,
+         取最强峰对应频率 -> HR = f_peak*60 (对齐 dVar32 = peak_freq*60*fs);
+      4) SNR = log10(主频峰值功率 / 全频带总功率) + 0.6
+         (对齐 b_CalHRSNR_core 中段 *param_5 = log10(peak/total)+0.6,
+          量纲与实测 SNR≈-0.2~0.3 完全吻合)。
+    返回 (hr_or_None, snr)。"""
+    from scipy.signal import find_peaks
+    ppg = np.asarray(ppg, float)
+    ppg = ppg - ppg.mean()
+    if len(ppg) < 8:
+        return None, -100.0
+    N = 4096
+    x = np.zeros(N, dtype=float)
+    x[:len(ppg)] = ppg
+    X = np.fft.rfft(x)
+    freq = np.fft.rfftfreq(N, d=1.0 / fs)
+    P = np.abs(X) ** 2
+    band = (freq >= 0.7) & (freq <= 4.0)
+    if not np.any(band):
+        return None, -100.0
+    fb = freq[band]
+    Pb = P[band]
+    if len(Pb) == 0 or Pb.max() <= 0:
+        return None, -100.0
+    # findpeaks: 高度 > 全局最大*0.3 (对齐 b_findpeaks 的 minpeakheight=max*0.3)
+    thr = float(Pb.max()) * 0.3
+    peaks, _ = find_peaks(Pb, height=thr)
+    if len(peaks) == 0:
+        best = int(np.argmax(Pb))
+    else:
+        best = int(peaks[np.argmax(Pb[peaks])])
+    hr = float(fb[best] * 60.0)
+    # SNR: 对齐 log10(peak/total)+0.6
+    total = float(Pb.sum())
+    peak_p = float(Pb[best])
+    if total <= 0 or peak_p <= 0:
+        snr = -100.0
+    else:
+        snr = float(np.log10(peak_p / total) + 0.6)
+    if not (40.0 <= hr <= 200.0):
+        return None, snr
+    return hr, snr
+
+
 def estimate_hr(ppg, fs):
-    from scipy.signal import welch
-    f, P = welch(ppg, fs=fs, nperseg=min(len(ppg), 512))
-    mask = (f >= 0.7) & (f <= 4.0)
-    if not np.any(mask):
-        return None
-    f = f[mask]; P = P[mask]
-    hr = f[np.argmax(P)] * 60.0
-    return float(hr)
+    """瞬时 HR (对齐 b_CalHRSNR_core 的 4096点FFT+findpeaks)。返回 hr 或 None。"""
+    hr, _ = _hr_snr_one(ppg, fs)
+    return hr
 
 
 def calc_hr_snr(ppg, fs):
-    """复刻 libCoreEngineV2.so::CalHRSNR_core 末尾:
-       HRSNR = log10(主频峰值功率 / 全频谱总功率) + 0.6
-    返回 SNR (float)。值越高表示 PPG 信噪比越好, 心率越可信。"""
-    from scipy.signal import welch
-    ppg = np.asarray(ppg, float)
-    if len(ppg) < 8:
-        return -100.0
-    f, P = welch(ppg, fs=fs, nperseg=min(len(ppg), 512))
-    P = np.maximum(P, 0.0)
-    total = float(np.sum(P))
-    if total <= 0:
-        return -100.0
-    peak = float(np.max(P))
-    snr = np.log10(peak / total) + 0.6
-    return float(snr)
+    """复刻 libCoreEngineV2.so::CalHRSNR_core: HRSNR = log10(主频峰值/全频总功率)+0.6。"""
+    _, snr = _hr_snr_one(ppg, fs)
+    return snr
 
 
 # 心率有效性判定 (对齐 libCoreEngineV2.so::CalHRSNR_core + FilterHRUsingPreviousDataRGB)
@@ -358,14 +407,18 @@ def get_window_group_feature(window_group_list):
 
 
 # ---------------- 摄像头采集 ----------------
-def _mean_hr(history):
-    """对齐 libCoreEngineV2.so::CalculateHRVIndex_RGB 的最终 HR 聚合逻辑。
+def _median_hr(history):
+    """对齐 libCoreEngineV2.so::CalculateInstantHRVIndex2_RGB 的最终 HR 聚合逻辑。
 
-    逆向结论: 最终 HR = CalculateInstantHRVIndex2_RGB 输出, 其底层对"有效 HR 序列"
-    (local_20b8: 仅保留 >0 的 HR 窗) 做 blockedSummation / count, 即**简单算术平均**,
-    而非 SNR 加权。SNR 加权(b_CalWeightMean)是另一条 HRV 子路径, 非最终 HR 输出。
+    逆向确认 (反编译 @0x18c2d4): 最终 HR 不是算术平均, 而是 **中位数**!
+      核心聚合调用 b_vmedian() (vertical median):
+        - 当有效 HR 窗数 local_4998>=2 时, 走 else 分支算 RR 间期后取 b_vmedian;
+        - 当 local_4998<2 时, 直接 b_vmedian(local_4920, n) 对有效 HR 序列取中位数。
+      之后 60.0/median_RR 才得到稳定 HR。
+    之前用 mean 聚合导致"完全不对": 偶发错窗会显著拉偏均值, 而中位数对离群窗更鲁棒,
+    这与用户实测"有时准有时不准"完全吻合。
 
-    因此这里: 仅用 snr>=HR_SNR_USABLE 且 HR 生理合理的窗, 取算术平均 -> 对齐 blockedSummation/count。
+    因此这里: 仅用 snr>=HR_SNR_USABLE 且 HR 生理合理的窗, 取中位数 -> 对齐 b_vmedian。
     同时复刻 "High HR change" 保护: 若 max-min > max*0.1 标记 unstable(原生会随机扰动/拒判)。
 
     返回 (hr, n_valid, unstable)。"""
@@ -374,13 +427,17 @@ def _mean_hr(history):
     if len(pts) < 1:
         return None, 0, False
     hrs = np.array(pts, float)
-    hr = float(hrs.mean())                      # blockedSummation / count
+    hr = float(np.median(hrs))                  # 对齐 b_vmedian (中位数)
     unstable = False
     if len(hrs) >= 2:
         mx, mn = float(hrs.max()), float(hrs.min())
         if mx > 0 and (mx - mn) > mx * HIGH_HR_CHANGE_RATIO:
             unstable = True                      # High HR change
     return hr, len(pts), unstable
+
+
+# 兼容旧调用名
+_mean_hr = _median_hr
 
 
 # MediaPipe FaceMesh 关键点, 对齐原生 parseRoiBoxFromLandmark 的输入:
@@ -473,7 +530,6 @@ def collect(camera_idx, seconds, fps):
     except Exception:
         fw, fh = 1280, 720
     make_window_fullscreen("rPPG", fw, fh)
-    fullscreen = True
     mp_face = mp.solutions.face_mesh.FaceMesh(
         static_image_mode=False, max_num_faces=1,
         refine_landmarks=True, min_detection_confidence=0.5)
@@ -515,6 +571,9 @@ def collect(camera_idx, seconds, fps):
             roi_a = rgb[y0:y1, x0:x1]
             allface_mean, vpp_a = _roi_mean_and_valid(roi_a)
             cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 1)  # AllFace 绿框
+            # 标注: 全脸 ROI 名称 + 具体坐标/尺寸 (对齐 .so 逆向的 2 个 ROI 定位结果)
+            put_text_cn(frame, f"全脸ROI AllFace  x={x0} y={y0} w={x1-x0} h={y1-y0}",
+                        (x0, max(0, y0 - 6)), (0, 255, 0), 0.45, 1)
 
         # ---- ROI B: ForeHead (parseRoiBoxFromLandmark) —— HR 主信号 ----
         fore_pts = [(int(lm[i].x * w), int(lm[i].y * h))
@@ -527,6 +586,9 @@ def collect(camera_idx, seconds, fps):
             roi_b = rgb[y0:y1, x0:x1]
             fore_mean, vpp_b = _roi_mean_and_valid(roi_b)
             cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 0), 2)  # ForeHead 青框
+            # 标注: 前额 ROI 名称 + 具体坐标/尺寸 (HR 主信号)
+            put_text_cn(frame, f"前额ROI ForeHead  x={x0} y={y0} w={x1-x0} h={y1-y0}",
+                        (x0, max(0, y0 - 6)), (255, 255, 0), 0.45, 1)
 
         # ---- 质量门控 (对齐原生) ----
         # 1) 至少 ForeHead 有效; 2) 帧间 ForeHead 均值 RGB 变化不超过阈值(否则 skip)
@@ -554,28 +616,46 @@ def collect(camera_idx, seconds, fps):
             rgb_ts_allface.append(allface_mean)  # 参考: AllFace
 
         # 每 HR_WINDOW_SEC 秒评估一次当前窗 HR/SNR (对齐 CalHRSNR_core)
+        # 双 ROI: 分别计算 ForeHead(主) 与 AllFace(参考) 的 HR+SNR, 选 SNR 更高者作为本窗结果。
+        # 对齐 libCoreEngineV2.so::c_CalS3CoreHR_RGB 的 e_maximum(选最佳 HR 通道/ROI)。
         now = time.time()
         if now - last_sample >= HR_WINDOW_SEC and len(rgb_ts) > 30:
             last_sample = now
-            sub = chrom_extract(rgb_ts, fps)
-            sub = bandpass(sub, fps)
-            hr = estimate_hr(sub, fps)
-            snr = calc_hr_snr(sub, fps)
+            # ForeHead (ROI B) 主信号
+            sub_f = bandpass(chrom_extract(rgb_ts, fps), fps)
+            hr_f = estimate_hr(sub_f, fps)
+            snr_f = calc_hr_snr(sub_f, fps)
+            # AllFace (ROI A) 参考信号
+            hr_a = snr_a = None
+            if len(rgb_ts_allface) > 30:
+                sub_a = bandpass(chrom_extract(rgb_ts_allface, fps), fps)
+                hr_a = estimate_hr(sub_a, fps)
+                snr_a = calc_hr_snr(sub_a, fps)
+            # 选 SNR 更高者入历史 (e_maximum: 取最优 ROI 的 HR)
+            hr = snr = None
+            best_src = "-"
+            if hr_f is not None and (hr_a is None or snr_f >= snr_a):
+                hr, snr, best_src = hr_f, snr_f, "前额"
+            elif hr_a is not None:
+                hr, snr, best_src = hr_a, snr_a, "全脸"
             snr_ok = (hr is not None) and (snr >= HR_SNR_USABLE)
             # 仅 SNR 达标的窗才入历史 (低 SNR = 无主频 = 不显示/不采纳)
             if snr_ok:
                 history.append((hr, snr))
             whr, nok, unst = _mean_hr(history)
-            # 实时显示 SNR (无论是否达标)
-            snr_col = (0, 255, 0) if snr_ok else (0, 0, 255)
-            cv2.putText(frame, f"SNR={snr:+.2f}", (10, 95),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, snr_col, 2)
+            # 实时显示 双 ROI 的 SNR (无论是否达标)
+            snr_fc = (0, 255, 0) if (hr_f is not None and snr_f >= HR_SNR_USABLE) else (0, 0, 255)
+            snr_ac = (0, 255, 0) if (hr_a is not None and snr_a >= HR_SNR_USABLE) else (0, 0, 255)
+            cv2.putText(frame, f"前额SNR={snr_f:+.2f} HR={hr_f if hr_f else 0:.0f}",
+                        (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, snr_fc, 2)
+            cv2.putText(frame, f"全脸SNR={snr_a if snr_a else -99:+.2f} HR={hr_a if hr_a else 0:.0f}",
+                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, snr_ac, 2)
             if not snr_ok:
                 # SNR 低: 明确不显示 HR, 提示信号差
                 put_text_cn(frame, "信号差-SNR过低, 不显示心率", (10, 30), (0, 0, 255), 0.9, 2)
             elif whr is not None:
                 col = (0, 255, 0) if (nok >= HR_MIN_VALID_SAMPLES and not unst) else (0, 255, 255)
-                put_text_cn(frame, f"心率≈{whr:.0f}  (n={nok})", (10, 30), col, 0.9, 2)
+                put_text_cn(frame, f"心率≈{whr:.0f}  (n={nok} 优选:{best_src})", (10, 30), col, 0.9, 2)
                 if unst:
                     put_text_cn(frame, "心率波动大-数据不稳", (10, 65), (0, 165, 255), 0.8, 2)
                 elif nok < HR_MIN_VALID_SAMPLES:
@@ -584,7 +664,7 @@ def collect(camera_idx, seconds, fps):
                 put_text_cn(frame, "采集中...", (10, 30), (0, 255, 0), 1, 2)
         else:
             whr, _, _ = _mean_hr(history)
-            # 非评估窗也显示最近一次 SNR 状态
+            # 非评估窗也显示最近一次 SNR 状态 + 操作提示
             if history:
                 last_snr = history[-1][1]
                 snr_col = (0, 255, 0) if last_snr >= HR_SNR_USABLE else (0, 0, 255)
@@ -594,14 +674,18 @@ def collect(camera_idx, seconds, fps):
                 put_text_cn(frame, f"心率≈{whr:.0f}", (10, 30), (0, 255, 0), 0.9, 2)
             else:
                 put_text_cn(frame, "采集中...", (10, 30), (0, 255, 0), 1, 2)
+        # 常驻操作提示 (全屏/窗口切换)
+        put_text_cn(frame, "F键/双击: 全屏切换  Q: 退出", (10, h - 24),
+                    (200, 200, 200), 0.55, 1)
         cv2.imshow("rPPG", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        if key == ord('f'):   # F 键切换全屏/窗口
-            fullscreen = not fullscreen
-            cv2.setWindowProperty("rPPG", cv2.WND_PROP_FULLSCREEN,
-                                  cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+        if key == ord('f'):   # F 键切换全屏/窗口 (复用鼠标双击同一逻辑)
+            try:
+                make_window_fullscreen._toggle()
+            except Exception:
+                pass
     cap.release()
     cv2.destroyAllWindows()
     n = len(rgb_ts)
@@ -634,8 +718,8 @@ def main():
     # 2) CHROM -> PPG
     ppg = chrom_extract(rgb_ts, fs)
     ppg = bandpass(ppg, fs)
-    # 最终 HR = 历史有效窗(仅 SNR>=门槛)的简单算术平均, 对齐 CalculateHRVIndex_RGB
-    # 的 blockedSummation/count (底层 CalculateInstantHRVIndex2_RGB 对有效 HR 序列取均值)。
+    # 最终 HR = 历史有效窗(仅 SNR>=门槛)的**中位数**, 对齐 CalculateInstantHRVIndex2_RGB
+    # 的 b_vmedian (反编译 @0x18c2d4 实测: 核心聚合是 b_vmedian 而非均值; 均值会显著拉偏)。
     # SNR 加权(b_CalWeightMean)是另一条 HRV 子路径, 不参与最终 HR 输出。
     hr, n_valid, hr_unstable = _mean_hr(history)
     snr_all = [s for _, s in history] if history else [-100]
