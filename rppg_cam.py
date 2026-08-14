@@ -81,17 +81,16 @@ def calc_hr_snr(ppg, fs):
     return float(snr)
 
 
-# 心率有效性判定 (对齐 libCoreEngineV2.so::FilterHRUsingPreviousDataRGB 意图)
-# 原生不对瞬时 SNR 一票否决, 而是:
-#   - 维护历史 HR/SNR 窗口, 用高置信 HR 加权得到平滑最终 HR (b_CalWeightMean)
-#   - 仅在 SNR 持续极低(无信号)时才退回 refHR / 放弃
-# 这里是务实复刻参数:
+# 心率有效性判定 (对齐 libCoreEngineV2.so::CalHRSNR_core + FilterHRUsingPreviousDataRGB)
+# 原生逻辑: 每窗算 SNR=log10(peak/total)+0.6。SNR 低(无明显主频)的窗直接作废,
+# 不进历史; 仅用 SNR 达标的窗做历史加权得到平滑 HR (b_CalWeightMean)。
+# 量纲实测: 干净 PPG SNR≈-0.4~0.3; 噪声大时趋近 -1.8。故门槛取 -0.5:
+# 低于它的窗视为"无信号", 不显示 HR、不计入加权。
 HR_WINDOW_SEC = 3.0        # 历史窗口采样间隔(秒)
 HR_MIN_VALID_SAMPLES = 3   # 历史中"可用"样本最少个数, 低于则判定信号不足
 HR_PHYS_LO, HR_PHYS_HI = 40.0, 200.0   # 心率生理合理区间(原生大量 0<HR 检查)
-# 单窗 SNR 可用门槛: 原生瞬时 SNR 是 log10(peak/total)+0.6 量纲(约 -0.5~0.5),
-# 这里取"基本有主频"的下限, 低于它的窗仅不计入加权、但不否决整体。
-HR_SNR_USABLE = -1.0
+# 单窗 SNR 可用门槛 (log10(peak/total)+0.6 量纲): 低于则不采纳该窗 HR
+HR_SNR_USABLE = -0.5
 
 # ---------------- ROI 几何 (逆向自 libcmtrack.so::TddFa::parseRoiBoxFrom*) ----------------
 # 原生每帧产出 2 个 ROI (CmTrackInterface::track @0x24da0 各调用一次):
@@ -495,7 +494,7 @@ def collect(camera_idx, seconds, fps):
         if allface_mean is not None:
             rgb_ts_allface.append(allface_mean)  # 参考: AllFace
 
-        # 每 HR_WINDOW_SEC 秒产生一个 (HR, SNR) 样本入历史
+        # 每 HR_WINDOW_SEC 秒评估一次当前窗 HR/SNR (对齐 CalHRSNR_core)
         now = time.time()
         if now - last_sample >= HR_WINDOW_SEC and len(rgb_ts) > 30:
             last_sample = now
@@ -503,10 +502,20 @@ def collect(camera_idx, seconds, fps):
             sub = bandpass(sub, fps)
             hr = estimate_hr(sub, fps)
             snr = calc_hr_snr(sub, fps)
-            if hr is not None:
+            snr_ok = (hr is not None) and (snr >= HR_SNR_USABLE)
+            # 仅 SNR 达标的窗才入历史 (低 SNR = 无主频 = 不显示/不采纳)
+            if snr_ok:
                 history.append((hr, snr))
             whr, nok = _weighted_hr(history)
-            if whr is not None:
+            # 实时显示 SNR (无论是否达标)
+            snr_col = (0, 255, 0) if snr_ok else (0, 0, 255)
+            cv2.putText(frame, f"SNR={snr:+.2f}", (10, 95),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, snr_col, 2)
+            if not snr_ok:
+                # SNR 低: 明确不显示 HR, 提示信号差
+                cv2.putText(frame, "SNR low - HR ignored", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            elif whr is not None:
                 col = (0, 255, 0) if nok >= HR_MIN_VALID_SAMPLES else (0, 255, 255)
                 cv2.putText(frame, f"HR≈{whr:.0f}  (n={nok})", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
@@ -518,6 +527,12 @@ def collect(camera_idx, seconds, fps):
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         else:
             whr, _ = _weighted_hr(history)
+            # 非评估窗也显示最近一次 SNR 状态
+            if history:
+                last_snr = history[-1][1]
+                snr_col = (0, 255, 0) if last_snr >= HR_SNR_USABLE else (0, 0, 255)
+                cv2.putText(frame, f"SNR={last_snr:+.2f}", (10, 95),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, snr_col, 2)
             if whr is not None:
                 cv2.putText(frame, f"HR≈{whr:.0f}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
@@ -560,18 +575,21 @@ def main():
     ppg = chrom_extract(rgb_ts, fs)
     ppg = bandpass(ppg, fs)
     # 最终 HR 用历史窗口加权 (对齐原生 FilterHRUsingPreviousDataRGB 的 b_CalWeightMean),
-    # 不再用瞬时 SNR 一票否决
+    # 但仅采纳 SNR 达标的窗 (已在 collect 内过滤), 且最终要求中位 SNR 达标才输出。
     hr, n_valid = _weighted_hr(history)
-    if hr is None:
-        # 退回: 用全段 FFT 兜底
-        hr = estimate_hr(ppg, fs)
     snr_all = [s for _, s in history] if history else [-100]
     snr_med = float(np.median(snr_all))
+    if hr is None:
+        # 退回: 用全段 FFT 兜底(仅当确有样本但全被 SNR 门控挡掉时)
+        hr = estimate_hr(ppg, fs)
     print(f"[心率·最终] HR ≈ {hr:.1f} bpm  (有效样本 {n_valid}/{len(history)})")
     print(f"[心率SNR] 中位 {snr_med:.3f}  (单窗可用门槛 {HR_SNR_USABLE:.2f})")
 
-    # 有效性: 对齐原生意图 —— 仅在 有效样本过少 或 HR 非生理 时放弃 (不卡瞬时 SNR)
-    hr_valid = (hr is not None) and (HR_PHYS_LO <= hr <= HR_PHYS_HI) and (n_valid >= HR_MIN_VALID_SAMPLES)
+    # 有效性: 中位 SNR 必须达标 + 有效样本足够 + HR 生理合理; 否则不显示 HR/不跑 BP
+    snr_ok = snr_med >= HR_SNR_USABLE
+    hr_valid = snr_ok and (hr is not None) and (HR_PHYS_LO <= hr <= HR_PHYS_HI) and (n_valid >= HR_MIN_VALID_SAMPLES)
+    if not snr_ok:
+        print(f"[心率] SNR 过低({snr_med:.2f} < {HR_SNR_USABLE:.2f}), 信号不可信, 不输出 HR/血压")
 
     # 3) PPG -> 74维特征 -> 窗口/组 -> 血压
     # 关键: get_window_feature 内部把每个 cycle 重采样到 900Hz 再提特征(fs 固定900),
