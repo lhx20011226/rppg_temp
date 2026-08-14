@@ -29,6 +29,45 @@ import argparse, time, sys, os
 import numpy as np
 import cv2
 
+# ---------------- GUI 中文绘制 + 全屏 ----------------
+# OpenCV 默认位图字体不含中文, 用 PIL 绘制中文再叠加, 避免显示成问号。
+_PIL_OK = False
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_OK = True
+except Exception:
+    pass
+
+
+def put_text_cn(frame, text, pos, color=(0, 255, 0), scale=0.7, thickness=2):
+    """在 BGR 帧上绘制中文文本 (无中文环境时退化为 cv2 英文)。"""
+    if not _PIL_OK:
+        cv2.putText(frame, text.encode("ascii", "ignore").decode(),
+                    pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+        return frame
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("msyh.ttc", int(20 * scale))
+    except Exception:
+        try:
+            font = ImageFont.truetype("simhei.ttf", int(20 * scale))
+        except Exception:
+            font = ImageFont.load_default()
+    draw.text((pos[0], pos[1]), text, fill=(color[2], color[1], color[0]), font=font)
+    return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+
+
+def make_window_fullscreen(name, w, h):
+    """创建可全屏窗口 (按 F 或双击标题栏可全屏; 这里默认最大化)。"""
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    try:
+        cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except Exception:
+        pass
+    cv2.resizeWindow(name, w, h)
+
+
 # ---------------- rPPG 信号提取 (CHROM) ----------------
 def chrom_extract(rgb_ts, fs):
     """CHROM: 输入 (N,3) RGB 时序, 返回 PPG 信号 (N,)"""
@@ -90,7 +129,13 @@ HR_WINDOW_SEC = 3.0        # 历史窗口采样间隔(秒)
 HR_MIN_VALID_SAMPLES = 3   # 历史中"可用"样本最少个数, 低于则判定信号不足
 HR_PHYS_LO, HR_PHYS_HI = 40.0, 200.0   # 心率生理合理区间(原生大量 0<HR 检查)
 # 单窗 SNR 可用门槛 (log10(peak/total)+0.6 量纲): 低于则不采纳该窗 HR
-HR_SNR_USABLE = -0.5
+# 量纲实测: 干净 PPG SNR≈-0.4~0.3; 噪声大时趋近 -1.8。
+# 原生 CalHRSNR_core 用 peak/total 判"有无主频", SNR<-0.8(peak/total<0.04)即视为无有效主频。
+# 故门槛取 -0.8: 仅采纳确有主频的窗进历史; 低于它的窗(真噪声)明确不显示/不采纳。
+HR_SNR_USABLE = -0.8
+# 对齐 CalculateHRVIndex_RGB 的 "High HR change" 判定:
+# 若历史 HR 序列 max-min > max*0.1, 视为心率突变不可信 -> 标记 unstable。
+HIGH_HR_CHANGE_RATIO = 0.1
 
 # ---------------- ROI 几何 (逆向自 libcmtrack.so::TddFa::parseRoiBoxFrom*) ----------------
 # 原生每帧产出 2 个 ROI (CmTrackInterface::track @0x24da0 各调用一次):
@@ -313,20 +358,29 @@ def get_window_group_feature(window_group_list):
 
 
 # ---------------- 摄像头采集 ----------------
-def _weighted_hr(history):
-    """对齐原生 b_CalWeightMean: 用 SNR 做权重对历史 HR 加权得到稳定 HR。
-    history: list of (hr, snr)。仅用 snr>=HR_SNR_USABLE 的样本, 权重=sigmoid(snr)。"""
-    pts = [(hr, snr) for hr, snr in history
+def _mean_hr(history):
+    """对齐 libCoreEngineV2.so::CalculateHRVIndex_RGB 的最终 HR 聚合逻辑。
+
+    逆向结论: 最终 HR = CalculateInstantHRVIndex2_RGB 输出, 其底层对"有效 HR 序列"
+    (local_20b8: 仅保留 >0 的 HR 窗) 做 blockedSummation / count, 即**简单算术平均**,
+    而非 SNR 加权。SNR 加权(b_CalWeightMean)是另一条 HRV 子路径, 非最终 HR 输出。
+
+    因此这里: 仅用 snr>=HR_SNR_USABLE 且 HR 生理合理的窗, 取算术平均 -> 对齐 blockedSummation/count。
+    同时复刻 "High HR change" 保护: 若 max-min > max*0.1 标记 unstable(原生会随机扰动/拒判)。
+
+    返回 (hr, n_valid, unstable)。"""
+    pts = [hr for hr, snr in history
            if hr is not None and HR_PHYS_LO <= hr <= HR_PHYS_HI and snr >= HR_SNR_USABLE]
     if len(pts) < 1:
-        return None, 0
-    hrs = np.array([p[0] for p in pts], float)
-    # 权重: SNR 越高权重越大 (sigmoid 映射到 0~1, 避免极端值)
-    w = 1.0 / (1.0 + np.exp(-(np.array([p[1] for p in pts], float) + 0.3) * 4.0))
-    if w.sum() <= 0:
-        w = np.ones_like(hrs)
-    hr = float(np.sum(hrs * w) / w.sum())
-    return hr, len(pts)
+        return None, 0, False
+    hrs = np.array(pts, float)
+    hr = float(hrs.mean())                      # blockedSummation / count
+    unstable = False
+    if len(hrs) >= 2:
+        mx, mn = float(hrs.max()), float(hrs.min())
+        if mx > 0 and (mx - mn) > mx * HIGH_HR_CHANGE_RATIO:
+            unstable = True                      # High HR change
+    return hr, len(pts), unstable
 
 
 # MediaPipe FaceMesh 关键点, 对齐原生 parseRoiBoxFromLandmark 的输入:
@@ -412,6 +466,14 @@ def collect(camera_idx, seconds, fps):
     if not cap.isOpened():
         raise RuntimeError(f"无法打开摄像头索引 {camera_idx}")
     cap.set(cv2.CAP_PROP_FPS, fps)
+    # 创建可全屏窗口 (按 F 键切换全屏/窗口; 默认最大化显示)
+    try:
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    except Exception:
+        fw, fh = 1280, 720
+    make_window_fullscreen("rPPG", fw, fh)
+    fullscreen = True
     mp_face = mp.solutions.face_mesh.FaceMesh(
         static_image_mode=False, max_num_faces=1,
         refine_landmarks=True, min_detection_confidence=0.5)
@@ -432,8 +494,7 @@ def collect(camera_idx, seconds, fps):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = mp_face.process(rgb)
         if not (res.multi_face_landmarks):
-            cv2.putText(frame, "NO FACE - skip", (10, h - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            put_text_cn(frame, "NO FACE - skip", (10, h - 20), (0, 0, 255), 0.8, 2)
             cv2.imshow("rPPG", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -470,8 +531,7 @@ def collect(camera_idx, seconds, fps):
         # ---- 质量门控 (对齐原生) ----
         # 1) 至少 ForeHead 有效; 2) 帧间 ForeHead 均值 RGB 变化不超过阈值(否则 skip)
         if fore_mean is None:
-            cv2.putText(frame, "ROI invalid - skip", (10, h - 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            put_text_cn(frame, "ROI invalid - skip", (10, h - 50), (0, 0, 255), 0.7, 2)
             cv2.imshow("rPPG", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -481,8 +541,7 @@ def collect(camera_idx, seconds, fps):
             if prev.sum() > 0:
                 change = float(np.abs(cur - prev).sum() / (prev.sum() + 1e-6))
                 if change > ROI_FRAME_RGB_CHANGE_TH:
-                    cv2.putText(frame, "motion - skip frame", (10, h - 80),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    put_text_cn(frame, "motion - skip frame", (10, h - 80), (0, 165, 255), 0.7, 2)
                     prev_fore = cur
                     cv2.imshow("rPPG", frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -506,27 +565,25 @@ def collect(camera_idx, seconds, fps):
             # 仅 SNR 达标的窗才入历史 (低 SNR = 无主频 = 不显示/不采纳)
             if snr_ok:
                 history.append((hr, snr))
-            whr, nok = _weighted_hr(history)
+            whr, nok, unst = _mean_hr(history)
             # 实时显示 SNR (无论是否达标)
             snr_col = (0, 255, 0) if snr_ok else (0, 0, 255)
             cv2.putText(frame, f"SNR={snr:+.2f}", (10, 95),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, snr_col, 2)
             if not snr_ok:
                 # SNR 低: 明确不显示 HR, 提示信号差
-                cv2.putText(frame, "SNR low - HR ignored", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                put_text_cn(frame, "信号差-SNR过低, 不显示心率", (10, 30), (0, 0, 255), 0.9, 2)
             elif whr is not None:
-                col = (0, 255, 0) if nok >= HR_MIN_VALID_SAMPLES else (0, 255, 255)
-                cv2.putText(frame, f"HR≈{whr:.0f}  (n={nok})", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
-                if nok < HR_MIN_VALID_SAMPLES:
-                    cv2.putText(frame, "signal weak, keep still", (10, 65),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                col = (0, 255, 0) if (nok >= HR_MIN_VALID_SAMPLES and not unst) else (0, 255, 255)
+                put_text_cn(frame, f"心率≈{whr:.0f}  (n={nok})", (10, 30), col, 0.9, 2)
+                if unst:
+                    put_text_cn(frame, "心率波动大-数据不稳", (10, 65), (0, 165, 255), 0.8, 2)
+                elif nok < HR_MIN_VALID_SAMPLES:
+                    put_text_cn(frame, "信号弱, 请保持静止", (10, 65), (0, 255, 255), 0.8, 2)
             else:
-                cv2.putText(frame, "collecting...", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                put_text_cn(frame, "采集中...", (10, 30), (0, 255, 0), 1, 2)
         else:
-            whr, _ = _weighted_hr(history)
+            whr, _, _ = _mean_hr(history)
             # 非评估窗也显示最近一次 SNR 状态
             if history:
                 last_snr = history[-1][1]
@@ -534,14 +591,17 @@ def collect(camera_idx, seconds, fps):
                 cv2.putText(frame, f"SNR={last_snr:+.2f}", (10, 95),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, snr_col, 2)
             if whr is not None:
-                cv2.putText(frame, f"HR≈{whr:.0f}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                put_text_cn(frame, f"心率≈{whr:.0f}", (10, 30), (0, 255, 0), 0.9, 2)
             else:
-                cv2.putText(frame, "collecting...", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                put_text_cn(frame, "采集中...", (10, 30), (0, 255, 0), 1, 2)
         cv2.imshow("rPPG", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        if key == ord('f'):   # F 键切换全屏/窗口
+            fullscreen = not fullscreen
+            cv2.setWindowProperty("rPPG", cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
     cap.release()
     cv2.destroyAllWindows()
     n = len(rgb_ts)
@@ -574,22 +634,27 @@ def main():
     # 2) CHROM -> PPG
     ppg = chrom_extract(rgb_ts, fs)
     ppg = bandpass(ppg, fs)
-    # 最终 HR 用历史窗口加权 (对齐原生 FilterHRUsingPreviousDataRGB 的 b_CalWeightMean),
-    # 但仅采纳 SNR 达标的窗 (已在 collect 内过滤), 且最终要求中位 SNR 达标才输出。
-    hr, n_valid = _weighted_hr(history)
+    # 最终 HR = 历史有效窗(仅 SNR>=门槛)的简单算术平均, 对齐 CalculateHRVIndex_RGB
+    # 的 blockedSummation/count (底层 CalculateInstantHRVIndex2_RGB 对有效 HR 序列取均值)。
+    # SNR 加权(b_CalWeightMean)是另一条 HRV 子路径, 不参与最终 HR 输出。
+    hr, n_valid, hr_unstable = _mean_hr(history)
     snr_all = [s for _, s in history] if history else [-100]
     snr_med = float(np.median(snr_all))
     if hr is None:
         # 退回: 用全段 FFT 兜底(仅当确有样本但全被 SNR 门控挡掉时)
         hr = estimate_hr(ppg, fs)
-    print(f"[心率·最终] HR ≈ {hr:.1f} bpm  (有效样本 {n_valid}/{len(history)})")
+    print(f"[心率·最终] HR ≈ {hr:.1f} bpm  (有效样本 {n_valid}/{len(history)})"
+          f"{'  [波动大-不稳]' if hr_unstable else ''}")
     print(f"[心率SNR] 中位 {snr_med:.3f}  (单窗可用门槛 {HR_SNR_USABLE:.2f})")
 
     # 有效性: 中位 SNR 必须达标 + 有效样本足够 + HR 生理合理; 否则不显示 HR/不跑 BP
     snr_ok = snr_med >= HR_SNR_USABLE
-    hr_valid = snr_ok and (hr is not None) and (HR_PHYS_LO <= hr <= HR_PHYS_HI) and (n_valid >= HR_MIN_VALID_SAMPLES)
+    hr_valid = (snr_ok and (hr is not None) and (HR_PHYS_LO <= hr <= HR_PHYS_HI)
+                and (n_valid >= HR_MIN_VALID_SAMPLES) and (not hr_unstable))
     if not snr_ok:
         print(f"[心率] SNR 过低({snr_med:.2f} < {HR_SNR_USABLE:.2f}), 信号不可信, 不输出 HR/血压")
+    elif hr_unstable:
+        print(f"[心率] 历史 HR 波动过大(max-min>max*{HIGH_HR_CHANGE_RATIO:.1f}), 视为不稳, 不输出 HR/血压")
 
     # 3) PPG -> 74维特征 -> 窗口/组 -> 血压
     # 关键: get_window_feature 内部把每个 cycle 重采样到 900Hz 再提特征(fs 固定900),
